@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贝壳租房筛选助手（面积 / 距离 / 单价 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.2.0
+// @version      2.3.0
 // @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、到某地的距离、每平米租金、停车条件筛选，标在地图上，可收藏和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -515,13 +515,20 @@
     ['brands', '品牌', (r) => r.brand || '其他'],
     ['parks', '停车', (r) => r.parkLabel || '未查'],
   ];
-  const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏']];
+  const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏/拉黑']];
+
+  // 小区黑名单：整个小区不再显示，跨会话、跨查询保留。键带城市，避免不同城市同名小区误伤
+  const blacklist = new Set(GM_getValue('kef-blk', []));
+  const blkKeyOf = (community) => `${cfg.cityId}:${community}`;
+  const isBlk = (r) => !!r.community && blacklist.has(blkKeyOf(r.community));
+  let showBlkList = false;
 
   // skip：算某个分面的计数时跳过它自己，否则选了「2室」之后「3室」永远显示 0
   function viewPass(r, skip) {
     if (r.alive === false) return false;
     const m = marks[r.url];
     if (m === 'hide' && !vf.showHidden) return false;
+    if (!vf.showHidden && isBlk(r)) return false;
     if (vf.onlyStar && m !== 'star') return false;
     if (!passes(r, cfg)) return false;
     if (vf.onlyLocated && r.lng == null) return false;
@@ -576,6 +583,22 @@
     applyParking(all, cfg);
     applyDetail(all, cfg);
     return s;
+  }
+
+  function toggleBlk(community, { silent = false } = {}) {
+    const key = blkKeyOf(community);
+    const adding = !blacklist.has(key);
+    if (adding) blacklist.add(key); else blacklist.delete(key);
+    GM_setValue('kef-blk', [...blacklist]);
+    if (adding && focus === community) focus = null;
+    refresh();
+    if (silent) return;
+    if (adding) {
+      const n = all.filter((r) => r.community === community).length;
+      st(`已拉黑「${esc(community)}」（${n} 套），以后都不再显示。<a class="undo" data-ub="${esc(community)}">撤销</a>`);
+    } else {
+      st(`已把「${esc(community)}」移出黑名单。`);
+    }
   }
 
   function toggleMark(url, kind) {
@@ -808,6 +831,17 @@
   #kef tr[data-u]{cursor:pointer}
   #kef tr.hl td{background:#e8f8f0}
   #kef tr.hid td{opacity:.45}
+  #kef tr.blk td{opacity:.4}
+  #kef tr.blk td a{text-decoration:line-through}
+  #kef .blk-tag{font-size:11px;color:#f54a45}
+  #kef .act[data-a="blk"]{font-size:11px;filter:grayscale(1);opacity:.55}
+  #kef .act[data-a="blk"]:hover,#kef .act[data-a="blk"].on{filter:none;opacity:1}
+  #kef .blk-btn{border-color:#f54a45;color:#f54a45}
+  #kef .blk-list{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0 2px}
+  #kef .blk-list .chip:hover{border-color:#f54a45;color:#f54a45}
+  #kef a.link,#kef a.undo{color:#3c9ce8;cursor:pointer;margin-left:6px}
+  #kef a.ajk{color:#3c9ce8;text-decoration:none;font-size:11px;white-space:nowrap}
+  #kef a.ajk:hover{text-decoration:underline}
   #kef td a{color:#1f2329;text-decoration:none}
   #kef td a:hover{color:#00ae66;text-decoration:underline}
   #kef .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -943,16 +977,33 @@
   function renderNote() {
     const el = $('vnote');
     if (!el) return;
-    if (!all.length) { el.innerHTML = '查询后在这里按居室 / 类型 / 品牌 / 关键词继续筛；表格里 ☆ 收藏、✕ 隐藏（会记住）。'; return; }
+    const blkHTML = () => {
+      const mine = [...blacklist].filter((k) => k.startsWith(`${cfg.cityId}:`)).map((k) => k.slice(k.indexOf(':') + 1));
+      if (!mine.length) return '';
+      let s = ` · <a class="link" id="v-blk">已拉黑 ${mine.length} 个小区${showBlkList ? ' ▴' : ' ▾'}</a>`;
+      if (showBlkList) {
+        s += `<div class="blk-list">${mine.map((c) =>
+          `<span class="chip" data-ub="${esc(c)}" title="移出黑名单">${esc(c)} ✕</span>`).join('')}</div>`;
+      }
+      return s;
+    };
+    if (!all.length) {
+      el.innerHTML = '查询后在这里按居室 / 类型 / 品牌 / 关键词继续筛；表格里 ☆ 收藏、✕ 隐藏、⛔ 拉黑小区（都会记住）。' + blkHTML();
+      return;
+    }
     const alive = all.filter((r) => r.alive !== false);
     const nStar = alive.filter((r) => marks[r.url] === 'star').length;
     const nHide = alive.filter((r) => marks[r.url] === 'hide').length;
+    const nBlk = alive.filter(isBlk).length;
     let h = `显示 <b>${rows.length}</b> / ${alive.length} 套`;
     if (nStar) h += ` · ★ ${nStar}`;
     if (nHide) h += ` · 已隐藏 ${nHide}`;
+    if (nBlk) h += ` · 拉黑小区里 ${nBlk} 套`;
+    h += blkHTML();
     if (focus) {
       const n = rows.filter((r) => groupKey(r) === focus).length;
       h += `<span class="chip on" id="v-unfocus" title="取消聚焦">只看 ${esc(focus)}（${n}）✕</span>`;
+      if (!isBlk({ community: focus })) h += `<span class="chip blk-btn" data-ub="${esc(focus)}" title="整个小区以后都不再显示">⛔ 拉黑这个小区</span>`;
     }
     const lo = loosened();
     if (lo) h += `<br><span class="warn">${lo}比查询时放宽了，范围外的房源要重新 ① 查询才有</span>`;
@@ -970,6 +1021,7 @@
     { k: 'parkLabel', t: '小区停车', wide: true, v: (r) => parkHTML(r) },
     { k: 'parkNear', t: '最近车场', num: true, wide: true, v: (r) => (r.parkNear != null ? `${r.parkNear}m` : '') },
     { k: 'carSpot', t: '车位', wide: true },
+    { k: 'community', t: '停车费', wide: true, nosort: true, v: (r) => ajkLink(r) },
     { k: 'water', t: '水电', wide: true, v: (r) => (r.water === '商水' ? '<span class="hot">商水商电</span>' : esc([r.water, r.power].filter(Boolean).join('/'))) },
     { k: 'gas', t: '燃气', wide: true },
     { k: 'checkin', t: '入住', wide: true },
@@ -989,13 +1041,23 @@
     return `<span class="${cls}" title="${esc(tip)}">${esc(label)}</span>`;
   }
 
+  // 停车费 / 车位数：安居客小区页上有，这里只放一个链接，点开由你自己看（不自动读取其他平台的数据）
+  const AJK_CITY = { 310000: 'shanghai', 110000: 'beijing', 440100: 'guangzhou', 440300: 'shenzhen', 330100: 'hangzhou',
+    320100: 'nanjing', 510100: 'chengdu', 420100: 'wuhan', 500000: 'chongqing', 120000: 'tianjin', 320500: 'suzhou', 610100: 'xa' };
+  function ajkLink(r) {
+    if (!r.community) return '';
+    const sub = AJK_CITY[cfg.cityId] || 'www';
+    const name = r.community.replace(/[(（].*$/, '').trim();
+    return `<a class="ajk" href="https://${sub}.anjuke.com/community/?kw=${encodeURIComponent(name)}" target="_blank" rel="noopener" title="在安居客看「${esc(name)}」的停车费、车位数">停车费↗</a>`;
+  }
+
   // 窄表：小区名下面一行塞下户型、楼层、电梯、停车这些
   function subLine(r) {
     const bits = [r.layout, r.facing, r.brand].filter(Boolean).map(esc);
     if (!wide) {
       if (r.floor) bits.push(esc(r.floor));
       if (r.elevatorInfo) bits.push(`电梯${esc(r.elevatorInfo)}`);
-      if (r.parkLabel) bits.push(`🅿${parkHTML(r)}${r.parkNear != null ? ` ${r.parkNear}m` : ''}`);
+      if (r.parkLabel) bits.push(`🅿${parkHTML(r)}${r.parkNear != null ? ` ${r.parkNear}m` : ''} ${ajkLink(r)}`);
       if (r.carSpot) bits.push(`车位${esc(r.carSpot)}`);
       if (r.water === '商水') bits.push('<span class="hot">商水商电</span>');
     }
@@ -1015,16 +1077,18 @@
     const cols = visibleCols();
     const list = focus ? rows.filter((r) => groupKey(r) === focus) : rows;
     $('th').innerHTML = `<tr><th data-k="community">小区 · ${list.length} 套</th>`
-      + cols.map((c) => `<th data-k="${c.k}"${c.num ? ' class="num"' : ''}>${c.t}</th>`).join('') + '<th></th></tr>';
+      + cols.map((c) => (c.nosort ? `<th>${c.t}</th>` : `<th data-k="${c.k}"${c.num ? ' class="num"' : ''}>${c.t}</th>`)).join('') + '<th></th></tr>';
     $('th').querySelectorAll('th[data-k]').forEach((th) => th.classList.toggle('on', th.dataset.k === sortKey));
     tb.innerHTML = list.slice(0, 500).map((r) => {
       const m = marks[r.url];
+      const blk = isBlk(r);
+      const cls = [m === 'hide' && 'hid', blk && 'blk'].filter(Boolean).join(' ');
       return `
-      <tr data-u="${esc(r.url)}" data-g="${esc(groupKey(r))}"${m === 'hide' ? ' class="hid"' : ''}>
-        <td><a href="${esc(r.url)}" target="_blank" title="${esc(r.title)}">${esc(r.community)}</a>${m === 'star' ? ' <span class="star">★</span>' : ''}
+      <tr data-u="${esc(r.url)}" data-g="${esc(groupKey(r))}"${cls ? ` class="${cls}"` : ''}>
+        <td><a href="${esc(r.url)}" target="_blank" title="${esc(r.title)}">${esc(r.community)}</a>${m === 'star' ? ' <span class="star">★</span>' : ''}${blk ? ' <span class="blk-tag">已拉黑</span>' : ''}
           <div class="sub">${subLine(r)}</div></td>
         ${cols.map((c) => `<td class="${c.num ? 'num' : 'cell'}${c.cls ? ` ${c.cls}` : ''}">${c.v ? c.v(r) : esc(r[c.k] ?? '')}</td>`).join('')}
-        <td class="ops"><span class="act${m === 'star' ? ' on' : ''}" data-a="star" title="收藏">${m === 'star' ? '★' : '☆'}</span><span class="act" data-a="hide" title="${m === 'hide' ? '取消隐藏' : '隐藏这套'}">${m === 'hide' ? '↺' : '✕'}</span></td></tr>`;
+        <td class="ops"><span class="act${m === 'star' ? ' on' : ''}" data-a="star" title="收藏">${m === 'star' ? '★' : '☆'}</span><span class="act" data-a="hide" title="${m === 'hide' ? '取消隐藏' : '隐藏这套'}">${m === 'hide' ? '↺' : '✕'}</span><span class="act${blk ? ' on' : ''}" data-a="blk" title="${blk ? '移出黑名单' : '拉黑整个小区，以后都不再显示'}">⛔</span></td></tr>`;
     }).join('') + (list.length > 500 ? `<tr><td colspan="${cols.length + 2}" class="sub">还有 ${list.length - 500} 套没列出，收紧条件或导出 CSV</td></tr>` : '');
   }
 
@@ -1101,8 +1165,10 @@
 
     // 结果筛选：分面 / 开关 / 聚焦 / 重置，全部委托
     el.querySelector('#vf').addEventListener('click', (e) => {
-      const t = e.target.closest('[data-f],[data-t],#v-unfocus,#v-reset');
+      const t = e.target.closest('[data-f],[data-t],[data-ub],#v-unfocus,#v-reset,#v-blk');
       if (!t) return;
+      if (t.dataset.ub != null) { toggleBlk(t.dataset.ub); return; }   // 拉黑 / 移出黑名单
+      if (t.id === 'v-blk') { showBlkList = !showBlkList; renderNote(); return; }
       if (t.dataset.f) {
         const k = t.dataset.f, v = t.dataset.v;
         vf[k] = vf[k].includes(v) ? vf[k].filter((x) => x !== v) : [...vf[k], v];
@@ -1150,6 +1216,7 @@
       const tr = e.target.closest('tr[data-u]');
       if (!tr || e.target.closest('a')) return;
       const act = e.target.closest('[data-a]');
+      if (act && act.dataset.a === 'blk') { toggleBlk(tr.dataset.g); return; }
       if (act) { toggleMark(tr.dataset.u, act.dataset.a); return; }
       const p = pins.get(tr.dataset.g);
       if (p && mapInstance) {
@@ -1195,7 +1262,13 @@
       });
     }, 500);
 
-    el.querySelector('#b-stop').onclick =() => { abort = true; st('<span class="warn">已请求停止…</span>'); };
+    el.querySelector('#b-stop').onclick = () => { abort = true; st('<span class="warn">已请求停止…</span>'); };
+
+    // 状态栏里的「撤销」拉黑
+    el.querySelector('#st').addEventListener('click', (e) => {
+      const u = e.target.closest('[data-ub]');
+      if (u) toggleBlk(u.dataset.ub);
+    });
 
     el.querySelector('#b-run').onclick = guard('b-run', async () => {
       const c = readUI();
@@ -1336,7 +1409,7 @@
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.2.0',
+        脚本版本: '2.3.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
