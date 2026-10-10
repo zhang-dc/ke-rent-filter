@@ -1,14 +1,16 @@
 // ==UserScript==
-// @name         贝壳租房筛选助手（面积 / 距离 / 单价 / 停车）
+// @name         贝壳租房筛选助手（面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.3.0
-// @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、到某地的距离、每平米租金、停车条件筛选，标在地图上，可收藏和导出。
+// @version      2.4.0
+// @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
+// @match        https://*.anjuke.com/community/*
 // @grant        unsafeWindow
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addValueChangeListener
 // @connect      ke.com
 // @run-at       document-start
 // @homepageURL  https://github.com/zhang-dc/ke-rent-filter
@@ -40,6 +42,95 @@
   'use strict';
 
   const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+  // ══════════════════ 0. 安居客小区页：记下你看到的小区信息 ══════════════════
+  // 贝壳地图数据里没有房龄。你在安居客浏览小区列表 / 小区详情时，把页面上显示的
+  // 竣工年份、停车位、停车费等记到脚本存储里（GM 存储跨站共享），贝壳面板按小区名匹配显示。
+  // 只读当前页面已经显示的内容，不发任何请求。
+  const AJK_CITY = { 310000: 'shanghai', 110000: 'beijing', 440100: 'guangzhou', 440300: 'shenzhen', 330100: 'hangzhou',
+    320100: 'nanjing', 510100: 'chengdu', 420100: 'wuhan', 500000: 'chongqing', 120000: 'tianjin', 320500: 'suzhou', 610100: 'xa' };
+  // 小区名归一：去括号内容、空白、间隔点，两边才对得上（「三花现代城(三期金兰苑)」→「三花现代城」）
+  const normName = (s) => String(s || '').replace(/[(（][^)）]*[)）]?/g, '').replace(/[\s·・]/g, '').trim();
+
+  function runAnjuke() {
+    const sub = location.hostname.split('.')[0];
+    const cityId = Object.keys(AJK_CITY).find((k) => AJK_CITY[k] === sub);
+    if (!cityId) return;
+    const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+    function collect() {
+      const found = [];
+      // 小区列表页
+      document.querySelectorAll('a.li-row').forEach((a) => {
+        const name = clean(a.querySelector('.li-community-title')?.textContent);
+        if (!name) return;
+        const year = +((a.querySelector('.year')?.textContent || '').match(/(\d{4})年/) || [])[1] || null;
+        const addr = clean([...(a.querySelectorAll('.props span') || [])].map((s) => s.textContent).filter((t) => t.includes('-')).pop());
+        const price = +((a.textContent.match(/(\d{4,6})\s*元\/m²/) || [])[1]) || null;
+        found.push({ name, year, addr, price, url: a.href });
+      });
+      // 小区详情页：label / value 成对
+      if (/\/community\/view\/\d+/.test(location.pathname)) {
+        const info = {};
+        document.querySelectorAll('.label').forEach((l) => {
+          const k = clean(l.textContent);
+          const vEl = l.nextElementSibling;
+          const v = clean(vEl?.querySelector('.value')?.textContent || vEl?.textContent);
+          if (k && v && k.length <= 6 && !(k in info)) info[k] = v;
+        });
+        const name = clean((document.title.split(/[，,]/)[0] || ''));
+        if (name && Object.keys(info).length) {
+          found.push({
+            name, url: location.href.split('?')[0],
+            year: +((info['竣工时间'] || '').match(/(\d{4})/) || [])[1] || null,
+            extra: Object.fromEntries(['停车位', '停车费', '车位管理费', '物业费', '总户数', '容积率', '绿化率', '建筑类型']
+              .filter((k) => info[k] && info[k] !== '暂无数据').map((k) => [k, info[k]])),
+          });
+        }
+      }
+      return found;
+    }
+
+    let last = '';
+    function save() {
+      const found = collect();
+      const sig = found.map((f) => f.name + f.year + JSON.stringify(f.extra || '')).join('|');
+      if (!found.length || sig === last) return;
+      last = sig;
+      const db = GM_getValue('kef-ajk', {});
+      for (const f of found) {
+        const key = `${cityId}:${normName(f.name)}`;
+        const old = db[key] || {};
+        db[key] = { ...old, ...Object.fromEntries(Object.entries(f).filter(([, v]) => v != null && v !== '')), extra: { ...(old.extra || {}), ...(f.extra || {}) }, t: Date.now() };
+      }
+      GM_setValue('kef-ajk', db);
+      const withYear = found.filter((f) => f.year).length;
+      toast(`贝壳租房筛选助手：已记下本页 ${found.length} 个小区${withYear ? `（${withYear} 个有竣工年份）` : ''}，累计 ${Object.keys(db).length} 个。`);
+    }
+
+    function toast(msg) {
+      let el = document.getElementById('kef-toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'kef-toast';
+        el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#00ae66;color:#fff;'
+          + 'padding:8px 12px;border-radius:8px;font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;'
+          + 'box-shadow:0 4px 16px rgba(0,0,0,.2);max-width:360px';
+        document.body.appendChild(el);
+      }
+      el.textContent = msg;
+      clearTimeout(el.__t);
+      el.style.display = 'block';
+      el.__t = setTimeout(() => { el.style.display = 'none'; }, 5000);
+    }
+
+    let t = 0;
+    const kick = () => { clearTimeout(t); t = setTimeout(save, 800); };
+    const start = () => { kick(); new MutationObserver(kick).observe(document.body, { childList: true, subtree: true }); };
+    if (document.readyState === 'loading') addEventListener('DOMContentLoaded', start); else start();
+  }
+
+  if (/(^|\.)anjuke\.com$/.test(location.hostname)) { runAnjuke(); return; }
 
   // ══════════════════ 1. 页面加载前：记下页面的地图 ══════════════════
   // 这一段跑在 document-start。页面不对外提供地图对象，
@@ -108,6 +199,7 @@
     minPrice: 0, maxPrice: 6000,
     minArea: 60, maxArea: 0,
     maxUnitPrice: 0,
+    maxBikeMin: 0, maxWalkMin: 0, maxMetroMin: 0, // 通勤分钟上限（满足任一即可），0 = 不限
     rentType: 'Urt200600000001',
     rooms: [], facings: [], floors: [], features: [],
     elevator: '',
@@ -126,17 +218,18 @@
   // 启动时整表读进内存 Map，之后改一条写一条。GM 存储只放配置、收藏这类小东西。
   // 有效期：坐标不过期；停车 60 天；详情 3 天（已下架的记 7 天）。过期的启动时清掉。
   const DAY = 864e5;
-  const TTL = { geo: Infinity, park: 60 * DAY, detail: 3 * DAY, dead: 7 * DAY };
-  const STORES = ['geo', 'park', 'detail', 'result'];
+  const TTL = { geo: Infinity, park: 60 * DAY, detail: 3 * DAY, dead: 7 * DAY, commute: 90 * DAY };
+  const STORES = ['geo', 'park', 'detail', 'result', 'commute'];
   const geoCache = new Map();         // `${cityId}:${小区}` → { lng, lat, t }
   const parkCache = new Map();        // `${cityId}:${小区}` → { own, ownNames, near, count, t }
   const detailCache = new Map();      // 房源编号 → { t, alive, deadReason, ...详情字段 }
+  const commuteCache = new Map();     // `v2|${cityId}:${小区}@锚点` → { bike, walk, metro, t }
   let lastResult = null;              // { all, queryCfg, savedAt }
   let idb = null;
 
   const idbReq = (q) => new Promise((res, rej) => { q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
   function idbOpen() {
-    const q = W.indexedDB.open('kef-cache', 1);
+    const q = W.indexedDB.open('kef-cache', 3);     // v3 加了 commute
     q.onupgradeneeded = () => STORES.forEach((s) => { if (!q.result.objectStoreNames.contains(s)) q.result.createObjectStore(s); });
     return idbReq(q);
   }
@@ -161,12 +254,13 @@
   async function initCache() {
     try {
       idb = await idbOpen();
-      const [g, p, d, r] = await Promise.all(STORES.map(idbLoad));
+      const [g, p, d, r, rd] = await Promise.all(STORES.map(idbLoad));
       const stale = { park: [], detail: [] };
       g.forEach((v, k) => geoCache.set(k, v));
       p.forEach((v, k) => (fresh(v, TTL.park) ? parkCache.set(k, v) : stale.park.push(k)));
       d.forEach((v, k) => (fresh(v, detailTTL(v)) ? detailCache.set(k, v) : stale.detail.push(k)));
       lastResult = r.get('last') || null;
+      rd.forEach((v, k) => (fresh(v, TTL.commute) ? commuteCache.set(k, v) : null));
       for (const [s, ks] of Object.entries(stale)) {
         if (ks.length) { const os = idb.transaction(s, 'readwrite').objectStore(s); ks.forEach((k) => os.delete(k)); }
       }
@@ -185,7 +279,7 @@
   const cacheReady = initCache();
 
   async function clearCache() {
-    geoCache.clear(); parkCache.clear(); detailCache.clear(); lastResult = null;
+    geoCache.clear(); parkCache.clear(); detailCache.clear(); commuteCache.clear(); lastResult = null;
     if (idb) STORES.forEach((s) => { try { idb.transaction(s, 'readwrite').objectStore(s).clear(); } catch {} });
   }
 
@@ -219,6 +313,14 @@
     return s + VOCAB.ORDER_AREA_DESC;
   }
 
+  // 标题「整租·控江四村 2室2厅」→「控江四村」。公寓类标题是一整句广告
+  //（「整租·城投宽庭 江湾社区 新E2户型 66平 …」），只取第一个词当小区名，否则定位、分组都对不上
+  function communityOf(title) {
+    const s = (title.split('·')[1] || title).replace(/\s+\d+室.*$/, '').trim();
+    const words = s.split(/\s+/);
+    return words.length > 1 && s.length > 12 ? words[0] : s;
+  }
+
   // desc 形如 "62m²|2室2厅1卫|南|链家"
   function parseRow(r) {
     const p = (r.desc || '').split('|').map((s) => s.trim());
@@ -228,7 +330,7 @@
     const title = r.title || '';
     return {
       raw: r, url: r.actionUrl, title,
-      community: (title.split('·')[1] || title).replace(/\s+\d+室.*$/, '').trim(),
+      community: communityOf(title),
       area, price,
       unitPrice: area ? Math.round(price / area) : 0,
       layout: p[1] || '', facing: p[2] || '', brand: p[3] || '',
@@ -244,6 +346,7 @@
     if (c.minPrice > 0 && r.price < c.minPrice) return false;
     if (c.maxPrice > 0 && r.price > c.maxPrice) return false;
     if (c.maxUnitPrice > 0 && r.unitPrice > c.maxUnitPrice) return false;
+    if (!commuteOK(r, c)) return false;
     if (r.distKm != null && c.radiusKm > 0 && r.distKm > c.radiusKm) return false;
     return true;
   }
@@ -253,7 +356,11 @@
     reqCount++;
     const url = `${API}?${qs({ cityId, dataSource: 'ZF', curPage: page, condition, type: '', resblockId: '', ...box })}`;
     const j = await (await rawFetch(url, { credentials: 'include' })).json();
+    // 两种错误格式都有：{errno, errmsg} 和 {code, msg}（比如登录失效是 code=31002「请先登录」）
     if (j.errno) throw new Error(`errno=${j.errno} ${j.errmsg || ''}`);
+    if (j.code && String(j.code) !== '0') {
+      throw new Error(/登录/.test(j.msg || '') ? '贝壳登录已失效，请在页面上重新登录后再查询' : `code=${j.code} ${j.msg || ''}`);
+    }
     return j.data || {};
   }
 
@@ -293,7 +400,9 @@
   // houselist 记录里没有经纬度。逐套开详情页要 0.7s/套；但同一小区共用坐标，
   // 用百度 LocalSearch 按小区名批量解析，几百个名字只要几十秒，且不给贝壳压力。
   let geoMap = null;
-  function geocodeOne(name) {
+  // box：限定在这个范围里搜。房源本来就是按范围查出来的，小区一定在范围内；
+  // 不限定的话同名小区会定位到别处（实测「政立小区」被定到 12km 外）
+  function geocodeOne(name, box) {
     return new Promise((resolve) => {
       const NS = W.BMapGL || W.BMap;
       if (!NS) return resolve(null);
@@ -309,22 +418,34 @@
           },
         });
         ls.setPageCapacity(1);
-        ls.search(name);
+        if (box) {
+          ls.searchInBounds(name, new NS.Bounds(new NS.Point(box.minLongitude, box.minLatitude), new NS.Point(box.maxLongitude, box.maxLatitude)));
+        } else ls.search(name);
         setTimeout(() => resolve(null), 5000);
       } catch { resolve(null); }
     });
   }
 
+  // 查询范围外扩一圈作为定位的合理范围
+  function geoBox(c) {
+    const b = c && radiusToBBox(c.anchorLat, c.anchorLng, c.radiusKm * 1.3 + 0.5);
+    return b;
+  }
+  const inBox = (p, b) => !b || (p.lat >= b.minLatitude && p.lat <= b.maxLatitude && p.lng >= b.minLongitude && p.lng <= b.maxLongitude);
+
   async function geocodeRows(list, c, onProgress) {
     await cacheReady;
     const names = [...new Set(list.map((r) => r.community).filter(Boolean))];
     const cityHint = c.cityId === 310000 ? '上海' : '';
+    const box = geoBox(queryCfg || c);
     let done = 0;
     for (const n of names) {
       if (abort) break;
       const key = `${c.cityId}:${n}`;
-      if (!geoCache.has(key)) {
-        const p = await geocodeOne(`${n} ${cityHint}`);
+      const cached = geoCache.get(key);
+      // 没缓存，或缓存的点落在查询范围外（多半是同名小区定错了）→ 限定范围重新搜
+      if (!cached || !inBox(cached, box)) {
+        const p = await geocodeOne(`${n} ${cityHint}`, box);
         if (p) { p.t = Date.now(); geoCache.set(key, p); idbPut('geo', key, p); }
         await sleep(GEO_DELAY);
       }
@@ -334,11 +455,15 @@
   }
 
   function applyGeo(list, c) {
+    const box = geoBox(queryCfg || c);
     for (const r of list) {
+      if (r.preciseXY) continue;                         // 详情页给过精确坐标的不覆盖
       const p = geoCache.get(`${c.cityId}:${r.community}`);
-      if (p && !r.preciseXY) {                           // 详情页给过精确坐标的不覆盖
+      if (p && inBox(p, box)) {
         r.lng = p.lng; r.lat = p.lat;
         r.distKm = +haversineKm(c.anchorLat, c.anchorLng, p.lat, p.lng).toFixed(2);
+      } else {
+        r.lng = null; r.lat = null; r.distKm = null;     // 范围外的点不可信，宁可当没定位
       }
     }
   }
@@ -493,11 +618,167 @@
     return n;
   }
 
+  // ══════════ 6c. 安居客记下的小区信息：房龄 / 停车费 / 车位数 ══════════
+  let ajkDb = GM_getValue('kef-ajk', {});
+
+  function findAjk(community, cityId) {
+    const n = normName(community);
+    if (!n) return null;
+    const exact = ajkDb[`${cityId}:${n}`];
+    if (exact) return exact;
+    if (n.length < 3) return null;
+    // 名字对不齐时退一步：互相包含，取最长的那个（「华润橡树湾」↔「华润置地橡树湾」这种不算，宁缺毋滥）
+    let best = null, bestLen = 0;
+    for (const [k, v] of Object.entries(ajkDb)) {
+      if (!k.startsWith(`${cityId}:`)) continue;
+      const m = k.slice(k.indexOf(':') + 1);
+      if (m.length >= 3 && (m.includes(n) || n.includes(m)) && m.length > bestLen) { best = v; bestLen = m.length; }
+    }
+    return best;
+  }
+
+  function applyAjk(list, c) {
+    const memo = new Map();
+    for (const r of list) {
+      if (!memo.has(r.community)) memo.set(r.community, findAjk(r.community, c.cityId));
+      const e = memo.get(r.community);
+      r.ajk = e || null;
+      r.year = (e && e.year) || null;
+      r.ajkParkSpots = (e && e.extra && e.extra['停车位']) || '';
+      r.ajkParkFee = (e && e.extra && e.extra['停车费']) || '';
+    }
+  }
+
+  const ageOf = (r) => (!r.year ? '房龄未知' : r.year >= 2015 ? '2015年后' : r.year >= 2010 ? '2010–2014' : r.year >= 2000 ? '2000–2009' : '2000年前');
+
+  // ══════════ 6d. 通勤时间：自行车 / 步行 / 地铁+自行车（百度路线规划） ══════════
+  // 直线距离会被河、高架、铁路骗到，三种方式都按真实路线算：
+  //   自行车：百度骑行路线的时间（约 12km/h）
+  //   步行：百度步行路线的时间
+  //   地铁+自行车：百度公交方案里只取纯地铁的，进站前、出站后超过 300m 的步行段换成骑车
+  //               （每段 +1 分钟取车还车），中途换乘仍按步行，取最快的方案
+  // 按「小区 + 锚点」缓存，换锚点才重算。
+  const BIKE_MPS = 3.33, WALK_MPS = 1.17;       // 和百度骑行 / 步行路线的速度一致
+  const BIKE_LEG_MIN_M = 300, BIKE_LEG_EXTRA_S = 60;
+  // 直线距离超过这个就不算了，肯定到不了（省请求）
+  const SKIP_KM = { walk: 2.5, bike: 6, metro: 10 };
+  const commuteKey = (c, community) => `v2|${c.cityId}:${community}@${c.anchorLng.toFixed(4)},${c.anchorLat.toFixed(4)}`;
+
+  function routeOnce(kind, from, to) {
+    return new Promise((resolve) => {
+      const NS = W.BMap;
+      const Ctor = NS && { bike: NS.RidingRoute, walk: NS.WalkingRoute, metro: NS.TransitRoute }[kind];
+      if (!Ctor || !geoMap) return resolve(null);
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      try {
+        const opts = {
+          onSearchComplete: (rs) => {
+            try {
+              if (!rs) return finish(null);
+              if (kind !== 'metro') {
+                const p = rs.getPlan(0);
+                return finish(p ? { dist: p.getDistance(false), sec: p.getDuration(false) } : null);
+              }
+              finish(bestMetroPlan(rs));
+            } catch { finish(null); }
+          },
+        };
+        if (kind === 'metro') opts.policy = W.BMAP_TRANSIT_POLICY_FIRST_SUBWAYS ?? 5;
+        new Ctor(geoMap, opts).search(new NS.Point(from.lng, from.lat), new NS.Point(to.lng, to.lat));
+        setTimeout(() => finish(null), 8000);
+      } catch { finish(null); }
+    });
+  }
+
+  // 公交方案 → 只要纯地铁的，接驳步行换骑车，取最快
+  function bestMetroPlan(rs) {
+    const SUBWAY = W.BMAP_LINE_TYPE_SUBWAY ?? 1;
+    let best = null;
+    for (let i = 0; i < rs.getNumPlans(); i++) {
+      const p = rs.getPlan(i);
+      const lines = [];
+      for (let j = 0; j < p.getNumLines(); j++) lines.push(p.getLine(j));
+      if (!lines.length || lines.some((l) => l.type !== SUBWAY)) continue;
+      const walks = [];
+      for (let j = 0; j < p.getNumRoutes(); j++) walks.push(p.getRoute(j).getDistance(false));
+      let sec = p.getDuration(false);
+      walks.forEach((d, j) => {
+        const edge = j === 0 || j === walks.length - 1;           // 进站前 / 出站后
+        if (edge && d > BIKE_LEG_MIN_M) sec += -d / WALK_MPS + d / BIKE_MPS + BIKE_LEG_EXTRA_S;
+      });
+      if (!best || sec < best.sec) best = { sec: Math.round(sec), lines: lines.map((l) => l.title).join('→') };
+    }
+    return best || { sec: null, lines: '' };                      // 没有纯地铁方案也缓存下来，免得重查
+  }
+
+  const minOf = (x) => (x && x.sec != null ? Math.round(x.sec / 60) : null);
+
+  function applyCommute(list, c) {
+    for (const r of list) {
+      const e = commuteCache.get(commuteKey(c, r.community));
+      r.commute = e || null;
+      r.bikeMin = e ? minOf(e.bike) : null;
+      r.walkMin = e ? minOf(e.walk) : null;
+      r.metroMin = e ? minOf(e.metro) : null;
+      const ms = [r.bikeMin, r.walkMin, r.metroMin].filter((v) => v != null);
+      r.commuteBest = ms.length ? Math.min(...ms) : null;
+    }
+    // 已定位的都算过了才算「就绪」，否则新查到的小区还没来得及算就被排除
+    const located = list.filter((r) => r.lng != null && r.community);
+    commuteReady = located.length > 0 && located.every((r) => r.commute);
+  }
+
+  // 三个上限「满足任一」即可。还没点过「🚲 通勤」时不过滤；点过之后，算不出通勤的（没定位上）也排除
+  function commuteOK(r, c) {
+    const lim = [[r.bikeMin, c.maxBikeMin], [r.walkMin, c.maxWalkMin], [r.metroMin, c.maxMetroMin]].filter(([, m]) => m > 0);
+    if (!lim.length) return true;
+    if (!r.commute) return !commuteReady;
+    return lim.some(([v, m]) => v != null && v <= m);
+  }
+  let commuteReady = false;     // 当前结果里是否已经算过通勤
+
+  async function lookupCommute(list, c, onProgress) {
+    await cacheReady;
+    if (!geoMap) await geocodeOne('人民广场');
+    const groups = new Map();
+    for (const r of list) if (r.lng != null && r.community && !groups.has(r.community)) groups.set(r.community, r);
+    const to = { lng: c.anchorLng, lat: c.anchorLat };
+    let done = 0;
+    for (const [name, r] of groups) {
+      if (abort) break;
+      const key = commuteKey(c, name);
+      if (!commuteCache.has(key)) {
+        const from = { lng: r.lng, lat: r.lat };
+        const km = haversineKm(from.lat, from.lng, to.lat, to.lng);
+        const e = { t: Date.now() };
+        for (const kind of ['bike', 'walk', 'metro']) {
+          if (abort) break;
+          if (km > SKIP_KM[kind]) { e[kind] = { sec: null, far: true }; continue; }
+          e[kind] = await routeOnce(kind, from, to);
+          await sleep(GEO_DELAY);
+        }
+        if (!abort && ['bike', 'walk', 'metro'].every((k) => e[k] !== null)) {   // 有一项失败就不缓存，下次重试
+          commuteCache.set(key, e); idbPut('commute', key, e);
+        }
+      }
+      onProgress?.({ done: ++done, total: groups.size });
+    }
+    applyCommute(list, c);
+  }
+
+  function commuteTip(r) {
+    const e = r.commute;
+    if (!e) return '';
+    const f = (x, label) => (x && x.sec != null ? `${label} ${Math.round(x.sec / 60)} 分钟${x.dist ? `（${(x.dist / 1000).toFixed(1)}km）` : ''}` : `${label} ${x && x.far ? '太远' : '无'}`);
+    return [f(e.bike, '自行车'), f(e.walk, '步行'), e.metro && e.metro.sec != null ? `地铁+自行车 ${Math.round(e.metro.sec / 60)} 分钟（${e.metro.lines}）` : `地铁+自行车 ${e.metro && e.metro.far ? '太远' : '无纯地铁方案'}`].join('\n');
+  }
+
   // ══════════════════ 7. 结果视图：本地二次筛选 ══════════════════
   // all 是查询全集，rows 是视图。每次都从 all 重算，条件随便收紧再放宽，不发请求。
   // 只有放宽到查询范围之外（面积下限、租金、半径、锚点）才需要重新查询，面板会提示。
   const marks = GM_getValue('kef-marks', {});            // url → 'star' | 'hide'，跨会话保留
-  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], kw: '', exkw: '',
+  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], kw: '', exkw: '',
     onlyStar: false, showHidden: false, onlyLocated: false, noComm: false };
   const vf = Object.assign({}, VF_DEFAULT, GM_getValue('kef-vf', {}));
   let focus = null;                                      // 地图上点中的小区，表格只看它
@@ -514,6 +795,7 @@
     ['types', '类型', (r) => r.cardType || '其他'],
     ['brands', '品牌', (r) => r.brand || '其他'],
     ['parks', '停车', (r) => r.parkLabel || '未查'],
+    ['ages', '房龄', ageOf],
   ];
   const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏/拉黑']];
 
@@ -581,6 +863,8 @@
     all = s.all; queryCfg = s.queryCfg || null;
     recomputeDist();
     applyParking(all, cfg);
+    applyAjk(all, cfg);
+    applyCommute(all, cfg);
     applyDetail(all, cfg);
     return s;
   }
@@ -718,7 +1002,8 @@
       const star = items.some((r) => marks[r.url] === 'star');
       const color = PIN_COLORS[bandOf(best.unitPrice)];
       const pt = new NS.Point(best.lng, best.lat);
-      const tip = `${items[0].community}｜${items.length} 套｜最低 ${best.unitPrice} 元/㎡`;
+      const tip = `${items[0].community}｜${items.length} 套｜最低 ${best.unitPrice} 元/㎡${best.year ? `｜${best.year}年竣工` : ''}${best.commute ? `
+${commuteTip(best)}` : ''}`;
       const html = `<div class="kef-pin${focus === k ? ' hl' : ''}${star ? ' star' : ''}" data-g="${id}" style="--c:${color}" title="${esc(tip)}">`
         + `${star ? '★ ' : ''}<b>${minPrice}${items.length > 1 ? '起' : ''}</b>`
         + `<span>${items.length > 1 ? `${items.length}套` : `${best.area}㎡`}</span></div>`;
@@ -775,7 +1060,7 @@
 
   // ══════════════════════════ 9. 面板 UI ══════════════════════════
   const CSS = `
-  #kef{position:fixed;right:16px;top:76px;z-index:2147483647;width:440px;max-height:88vh;display:flex;flex-direction:column;
+  #kef{position:fixed;right:16px;top:76px;z-index:2147483647;width:500px;max-height:88vh;display:flex;flex-direction:column;
     background:#fff;border:1px solid #d8dde3;border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.18);
     font:13px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1f2329}
   #kef.min{max-height:42px;overflow:hidden}
@@ -842,6 +1127,9 @@
   #kef a.link,#kef a.undo{color:#3c9ce8;cursor:pointer;margin-left:6px}
   #kef a.ajk{color:#3c9ce8;text-decoration:none;font-size:11px;white-space:nowrap}
   #kef a.ajk:hover{text-decoration:underline}
+  #kef .new{color:#00ae66;font-weight:600}
+  #kef .presets{display:flex;gap:6px;align-items:center;margin:2px 0 6px}
+  #kef .presets .k{color:#8a9099;font-size:12px;width:52px}
   #kef td a{color:#1f2329;text-decoration:none}
   #kef td a:hover{color:#00ae66;text-decoration:underline}
   #kef .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -894,11 +1182,15 @@
         <label class="k">租金≤</label><input type="number" id="f-pmax" value="${cfg.maxPrice}">
         <label class="k">元/㎡≤</label><input type="number" id="f-uprice" value="${cfg.maxUnitPrice}">
         <label class="k">半径km</label><input type="number" id="f-radius" step="0.5" value="${cfg.radiusKm}">
+        <label class="k" title="自行车到锚点的分钟数上限。三项通勤满足任一即可">自行车≤</label><input type="number" id="f-bike" placeholder="分钟" value="${cfg.maxBikeMin || 0}">
+        <label class="k" title="步行到锚点的分钟数上限。三项通勤满足任一即可">步行≤</label><input type="number" id="f-walk" placeholder="分钟" value="${cfg.maxWalkMin || 0}">
+        <label class="k" title="地铁+自行车（接驳骑车）到锚点的分钟数上限。三项通勤满足任一即可">地铁+骑≤</label><input type="number" id="f-metro" placeholder="分钟" value="${cfg.maxMetroMin || 0}">
         <label class="k">锚点</label><input type="text" id="f-aname" value="${esc(cfg.anchorName)}" placeholder="输地名回车，或地图上右键">
         <label class="k">城市ID</label><input type="number" id="f-city" value="${cfg.cityId}">
         <label class="k">经纬</label><input type="text" id="f-anchor" value="${cfg.anchorLng},${cfg.anchorLat}" title="锚点框输地名回车自动填；或在地图上右键直接设锚点">
         <label class="k">电梯</label><select id="f-ele">${VOCAB.elevator.map(([v, t]) => `<option value="${v}"${cfg.elevator === v ? ' selected' : ''}>${t}</option>`).join('')}</select>
       </div>
+      <div class="presets"><span class="k">预设</span><span class="chip" id="b-preset-bd" title="自行车≤20 / 步行≤30 / 地铁+自行车≤20 分钟，满足任一">字节房补</span></div>
       <details id="query-opts" open><summary>贝壳官方条件（改了要重新 ① 查询）</summary>
         <div class="grp">方式</div><div class="chips">${chips('rentType', VOCAB.rentType, cfg.rentType)}</div>
         <div class="grp">户型（不选=不限）</div><div class="chips">${chips('rooms', VOCAB.room, cfg.rooms)}</div>
@@ -914,6 +1206,7 @@
       </div>
       <div class="acts">
         <button class="ghost" id="b-park" title="按小区查百度 POI：小区自有停车场（地下/地上）、最近公共停车场距离。数据来自百度地图，有缓存">🅿 查停车</button>
+        <button class="ghost" id="b-commute" title="按百度路线规划算每个小区到锚点的自行车 / 步行 / 地铁+自行车时间，有缓存">🚲 通勤</button>
         <button class="ghost" id="b-detail" title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
         <button class="ghost" id="b-csv">导出 CSV</button>
       </div>
@@ -945,12 +1238,13 @@
       minArea: num(g('f-amin').value), maxArea: num(g('f-amax').value),
       minPrice: num(g('f-pmin').value), maxPrice: num(g('f-pmax').value),
       maxUnitPrice: num(g('f-uprice').value), radiusKm: num(g('f-radius').value),
+      maxBikeMin: num(g('f-bike').value), maxWalkMin: num(g('f-walk').value), maxMetroMin: num(g('f-metro').value),
       cityId: num(g('f-city').value), anchorName: g('f-aname').value.trim(),
       elevator: g('f-ele').value,
       anchorLng: Number.isFinite(lng) ? lng : cfg.anchorLng,
       anchorLat: Number.isFinite(lat) ? lat : cfg.anchorLat,
     });
-    if (cfg.anchorLng !== prevLng || cfg.anchorLat !== prevLat) recomputeDist();
+    if (cfg.anchorLng !== prevLng || cfg.anchorLat !== prevLat) { recomputeDist(); applyCommute(all, cfg); }
     GM_setValue('kef-cfg', cfg);
     return cfg;
   }
@@ -965,7 +1259,8 @@
       for (const r of all) if (viewPass(r, k)) { const v = fn(r); cnt.set(v, (cnt.get(v) || 0) + 1); }
       for (const v of vf[k]) if (!cnt.has(v)) cnt.set(v, 0);
       if (cnt.size <= 1 && !vf[k].length) return '';           // 只有一种取值，没得筛
-      const items = [...cnt].sort((a, b) => (k === 'rooms' ? a[0].localeCompare(b[0], 'zh') : b[1] - a[1]));
+      const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'] };
+      const items = [...cnt].sort((a, b) => (ORDER[k] ? ORDER[k].indexOf(a[0]) - ORDER[k].indexOf(b[0]) : k === 'rooms' ? a[0].localeCompare(b[0], 'zh') : b[1] - a[1]));
       return `<div class="frow"><span class="fk">${name}</span>${items.map(([v, c]) =>
         `<span class="chip${vf[k].includes(v) ? ' on' : ''}" data-f="${k}" data-v="${esc(v)}">${esc(v)} <i>${c}</i></span>`).join('')}</div>`;
     }).join('');
@@ -1016,12 +1311,18 @@
     { k: 'price', t: '月租', num: true },
     { k: 'unitPrice', t: '元/㎡', num: true },
     { k: 'distKm', t: 'km', num: true },
+    { k: 'commuteBest', t: '通勤', num: true, v: (r) => commuteCell(r) },
+    { k: 'bikeMin', t: '自行车', num: true, wide: true, v: (r) => minCell(r.bikeMin, cfg.maxBikeMin) },
+    { k: 'walkMin', t: '步行', num: true, wide: true, v: (r) => minCell(r.walkMin, cfg.maxWalkMin) },
+    { k: 'metroMin', t: '地铁+骑', num: true, wide: true, v: (r) => minCell(r.metroMin, cfg.maxMetroMin, r.commute && r.commute.metro && r.commute.metro.lines) },
+    { k: 'year', t: '竣工', num: true, v: (r) => (r.year ? `<span class="${r.year >= 2010 ? 'new' : ''}">${r.year}</span>` : ajkLink(r, '查')) },
     { k: 'floor', t: '楼层', wide: true },
     { k: 'elevatorInfo', t: '电梯', wide: true },
     { k: 'parkLabel', t: '小区停车', wide: true, v: (r) => parkHTML(r) },
     { k: 'parkNear', t: '最近车场', num: true, wide: true, v: (r) => (r.parkNear != null ? `${r.parkNear}m` : '') },
     { k: 'carSpot', t: '车位', wide: true },
-    { k: 'community', t: '停车费', wide: true, nosort: true, v: (r) => ajkLink(r) },
+    { k: 'ajkParkSpots', t: '车位数', wide: true },
+    { k: 'ajkParkFee', t: '停车费', wide: true, v: (r) => (r.ajkParkFee ? esc(r.ajkParkFee) : ajkLink(r, '查')) },
     { k: 'water', t: '水电', wide: true, v: (r) => (r.water === '商水' ? '<span class="hot">商水商电</span>' : esc([r.water, r.power].filter(Boolean).join('/'))) },
     { k: 'gas', t: '燃气', wide: true },
     { k: 'checkin', t: '入住', wide: true },
@@ -1030,6 +1331,18 @@
   ];
   let wide = !!GM_getValue('kef-wide', false);
   const visibleCols = () => COLS.filter((c) => wide || !c.wide);
+
+  // 通勤：显示最快的那种方式，悬停看三种明细；满足上限的标绿
+  function commuteCell(r) {
+    if (r.commuteBest == null) return r.commute ? '<span class="park-no">远</span>' : '';
+    const mode = r.commuteBest === r.bikeMin ? '骑' : r.commuteBest === r.metroMin ? '铁' : '走';
+    const ok = (cfg.maxBikeMin || cfg.maxWalkMin || cfg.maxMetroMin) && commuteOK(r, cfg);
+    return `<span class="${ok ? 'new' : ''}" title="${esc(commuteTip(r))}">${mode}${r.commuteBest}′</span>`;
+  }
+  function minCell(v, max, tip) {
+    if (v == null) return '';
+    return `<span class="${max > 0 && v <= max ? 'new' : ''}"${tip ? ` title="${esc(tip)}"` : ''}>${v}′</span>`;
+  }
 
   function parkHTML(r) {
     const label = r.parkLabel;
@@ -1041,14 +1354,14 @@
     return `<span class="${cls}" title="${esc(tip)}">${esc(label)}</span>`;
   }
 
-  // 停车费 / 车位数：安居客小区页上有，这里只放一个链接，点开由你自己看（不自动读取其他平台的数据）
-  const AJK_CITY = { 310000: 'shanghai', 110000: 'beijing', 440100: 'guangzhou', 440300: 'shenzhen', 330100: 'hangzhou',
-    320100: 'nanjing', 510100: 'chengdu', 420100: 'wuhan', 500000: 'chongqing', 120000: 'tianjin', 320500: 'suzhou', 610100: 'xa' };
-  function ajkLink(r) {
+  // 安居客小区页：房龄、停车费、车位数在那边。点开浏览时脚本会顺手记下（见第 0 节）
+  // 记过的小区直接跳详情页，没记过的跳安居客小区搜索。打开浏览时脚本会把房龄、停车费记下来
+  function ajkLink(r, label = '安居客') {
     if (!r.community) return '';
     const sub = AJK_CITY[cfg.cityId] || 'www';
-    const name = r.community.replace(/[(（].*$/, '').trim();
-    return `<a class="ajk" href="https://${sub}.anjuke.com/community/?kw=${encodeURIComponent(name)}" target="_blank" rel="noopener" title="在安居客看「${esc(name)}」的停车费、车位数">停车费↗</a>`;
+    const name = normName(r.community);
+    const href = (r.ajk && r.ajk.url) || `https://${sub}.anjuke.com/community/?kw=${encodeURIComponent(name)}`;
+    return `<a class="ajk" href="${esc(href)}" target="_blank" rel="noopener" title="在安居客打开「${esc(name)}」，页面上的竣工年份、停车费、车位数会自动记下">${label}↗</a>`;
   }
 
   // 窄表：小区名下面一行塞下户型、楼层、电梯、停车这些
@@ -1094,7 +1407,7 @@
 
   function exportCSV() {
     const cols = ['community', 'title', 'area', 'layout', 'facing', 'price', 'unitPrice', 'distKm', 'floor', 'elevatorInfo',
-      'parkLabel', 'parkNear', 'carSpot', 'water', 'power', 'gas', 'heating', 'checkin', 'lease', 'brand', 'cardType', 'tags', 'star', 'url'];
+      'bikeMin', 'walkMin', 'metroMin', 'year', 'parkLabel', 'parkNear', 'carSpot', 'ajkParkSpots', 'ajkParkFee', 'water', 'power', 'gas', 'heating', 'checkin', 'lease', 'brand', 'cardType', 'tags', 'star', 'url'];
     const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
     const csv = '﻿' + [cols.join(','), ...rows.map((r) => cols.map((c) => q(c === 'star' ? (marks[r.url] === 'star' ? '★' : '') : r[c])).join(','))].join('\n');
     const a = document.createElement('a');
@@ -1159,7 +1472,7 @@
     });
 
     // 数字框即时筛选：查过之后改面积/租金/单价/半径，结果和地图立刻跟着变
-    ['f-amin', 'f-amax', 'f-pmin', 'f-pmax', 'f-uprice', 'f-radius', 'f-anchor'].forEach((id) => {
+    ['f-amin', 'f-amax', 'f-pmin', 'f-pmax', 'f-uprice', 'f-radius', 'f-bike', 'f-walk', 'f-metro', 'f-anchor'].forEach((id) => {
       el.querySelector(`#${id}`).addEventListener('input', () => { readUI(); if (all.length) refreshSoon(); });
     });
 
@@ -1177,7 +1490,7 @@
       } else if (t.id === 'v-unfocus') {
         focusGroup(focus); return;
       } else if (t.id === 'v-reset') {
-        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [] });
+        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [] });
         el.querySelector('#v-kw').value = ''; el.querySelector('#v-ex').value = '';
         focus = null;
       }
@@ -1278,8 +1591,11 @@
         (p) => st(`面积降序第 ${p.page} 页 · 命中 <b>${p.found}</b> / 候选 ${p.total} · ${reqCount} 请求`));
       all = res.list;
       // 坐标 / 停车按小区、详情按房源，缓存里有的直接带上，不发请求
+      queryCfg = { ...c };                               // applyGeo 要用新的查询范围校验坐标
       applyGeo(all, c);
       applyParking(all, c);
+      applyAjk(all, c);
+      applyCommute(all, c);
       const nDetail = applyDetail(all, c);
       queryCfg = { ...c };
       focus = null;
@@ -1292,7 +1608,8 @@
       const located = all.filter((r) => r.lng != null).length;
       const parked = all.filter((r) => r.parkLabel).length;
       msg += `<br>缓存命中：坐标 ${located} 套 · 停车 ${parked} 套 · 详情 ${nDetail} 套。`;
-      msg += located < all.length ? '下一步点「② 定位」补剩下的坐标。' : '坐标齐了，可以直接点「③ 画到地图」。';
+      if (!all.length) msg += '没有符合条件的房源，放宽一下条件试试。';
+      else msg += located < all.length ? '下一步点「② 定位」补剩下的坐标。' : '坐标齐了，可以直接点「③ 画到地图」。';
       st(msg);
       if (all.length) el.querySelector('#query-opts').open = false;   // 腾地方给结果
     });
@@ -1301,6 +1618,7 @@
       if (!all.length) return st('先点「① 查询」');
       const c = readUI();
       await geocodeRows(all, c, (p) => st(`解析小区坐标 ${p.done}/${p.total}（百度地图）`));
+      applyCommute(all, c);
       const located = all.filter((r) => r.lng != null).length;
       sortKey = 'distKm'; sortAsc = true;
       saveResult();
@@ -1362,6 +1680,49 @@
       st(msg);
     });
 
+    el.querySelector('#b-commute').onclick = guard('b-commute', async () => {
+      if (!all.length) return st('<span class="warn">先点「① 查询」，再点「② 定位」。</span>');
+      if (!all.some((r) => r.lng != null)) return st('<span class="warn">要先有小区坐标，点「② 定位」。</span>');
+      const c = readUI();
+      await lookupCommute(all, c, (p) => st(`算通勤路线 ${p.done}/${p.total} 个小区（自行车 / 步行 / 地铁，百度地图）`));
+      saveResult();
+      sortKey = 'commuteBest'; sortAsc = true;
+      refresh();
+      const comms = new Map(all.filter((r) => r.commute).map((r) => [r.community, r]));
+      const cnt = (f) => [...comms.values()].filter(f).length;
+      const okRows = all.filter((r) => r.commute && r.alive !== false && !isBlk(r) && commuteOK(r, cfg)).length;
+      const anyLimit = cfg.maxBikeMin || cfg.maxWalkMin || cfg.maxMetroMin;
+      st(`通勤算完 ${comms.size} 个小区：自行车 20 分钟内 ${cnt((r) => r.bikeMin != null && r.bikeMin <= 20)} 个 · `
+        + `步行 30 分钟内 ${cnt((r) => r.walkMin != null && r.walkMin <= 30)} 个 · 地铁+骑 20 分钟内 ${cnt((r) => r.metroMin != null && r.metroMin <= 20)} 个。`
+        + (anyLimit ? `<br>按当前通勤上限（满足任一）符合 <b>${okRows}</b> 套。` : '<br>在上面填通勤上限，或点「预设：字节房补」。'));
+    });
+
+    // 预设：字节房补的通勤要求——自行车 20 / 步行 30 / 地铁+自行车 20 分钟，满足任一。锚点用你设的办公地点
+    el.querySelector('#b-preset-bd').onclick = () => {
+      el.querySelector('#f-bike').value = 20;
+      el.querySelector('#f-walk').value = 30;
+      el.querySelector('#f-metro').value = 20;
+      if (num(el.querySelector('#f-radius').value) < 5) el.querySelector('#f-radius').value = 5;   // 自行车 20 分钟大约直线 3～4km，地铁更远
+      readUI();
+      if (all.length) refresh();
+      const lo = loosened();
+      st('已套用「字节房补」通勤预设：自行车≤20 · 步行≤30 · 地铁+自行车≤20 分钟（满足任一）。锚点请设成你的办公地点。'
+        + (lo ? '<br><span class="warn">半径放大到 5km 了，点「① 查询」重新查，再依次点「② 定位」「🚲 通勤」。</span>'
+          : (all.length && !all.some((r) => r.commute) ? '<br>下一步点「🚲 通勤」算每个小区的通勤时间。' : '')));
+    };
+
+    // 在安居客浏览小区页时记下的新信息，实时同步过来
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener('kef-ajk', (_k, _old, v, remote) => {
+        if (!remote) return;
+        ajkDb = v || {};
+        applyAjk(all, cfg);
+        refresh();
+        const n = all.filter((r) => r.year).length;
+        st(`已同步安居客记下的小区信息：当前结果里 ${n} 套有竣工年份。`);
+      });
+    }
+
     el.querySelector('#b-park').onclick = guard('b-park', async () => {
       if (!all.length) return st('<span class="warn">先点「① 查询」，再点「② 定位」。</span>');
       if (!all.some((r) => r.lng != null)) return st('<span class="warn">要先有小区坐标，点「② 定位」。</span>');
@@ -1404,12 +1765,12 @@
     cfg, vf, marks,
     redraw: () => drawOnMap(rows, false),
     clearCache,                              // __kef.clearCache() 清掉 IndexedDB 里的全部缓存
-    cacheStats: () => ({ IndexedDB: !!idb, 小区坐标: geoCache.size, 小区停车: parkCache.size, 房源详情: detailCache.size, 上次结果: lastResult ? lastResult.all.length : 0 }),
+    cacheStats: () => ({ IndexedDB: !!idb, 小区坐标: geoCache.size, 小区停车: parkCache.size, 房源详情: detailCache.size, 通勤路线: commuteCache.size, 安居客小区: Object.keys(ajkDb).length, 上次结果: lastResult ? lastResult.all.length : 0 }),
     diag() {
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.3.0',
+        脚本版本: '2.4.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
