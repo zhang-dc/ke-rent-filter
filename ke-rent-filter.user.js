@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贝壳租房筛选助手（面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.4.0
+// @version      2.4.1
 // @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -632,9 +632,18 @@
     for (const [k, v] of Object.entries(ajkDb)) {
       if (!k.startsWith(`${cityId}:`)) continue;
       const m = k.slice(k.indexOf(':') + 1);
-      if (m.length >= 3 && (m.includes(n) || n.includes(m)) && m.length > bestLen) { best = v; bestLen = m.length; }
+      if (m.length >= 3 && (m.includes(n) || n.includes(m) || nearSame(m, n)) && m.length > bestLen) { best = v; bestLen = m.length; }
     }
     return best;
+  }
+
+  // 一个名字是另一个删掉一两个字的结果：「新江湾时代花园」↔「新江湾城时代花园」
+  function nearSame(a, b) {
+    const [s, l] = a.length <= b.length ? [a, b] : [b, a];
+    if (s.length < 4 || l.length - s.length > 2) return false;
+    let i = 0;
+    for (const ch of l) if (ch === s[i]) i++;
+    return i === s.length;
   }
 
   function applyAjk(list, c) {
@@ -1770,7 +1779,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.4.0',
+        脚本版本: '2.4.1',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
