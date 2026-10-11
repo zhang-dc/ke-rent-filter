@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.7.0
+// @version      2.7.1
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -507,7 +507,15 @@
         if (abort) break;
       }
     } catch (e) { error = e.message; }
-    return { list: [...out.values()], total, error };
+    // 同一套房常被多个经纪人重复挂：小区 + 户型 + 价格 + 面积完全相同的只留一条，其余链接挂在 dupUrls 上
+    const seen = new Map();
+    let dup = 0;
+    for (const r of out.values()) {
+      const k = `${normName(r.community)}|${r.layout}|${r.price}|${r.area}`;
+      const first = seen.get(k);
+      if (first) { (first.dupUrls = first.dupUrls || []).push(r.url); dup++; } else seen.set(k, r);
+    }
+    return { list: [...seen.values()], total, error, dup };
   }
 
   // ══════════ 5. 坐标：小区名 → 经纬度（百度地图） ══════════
@@ -1287,6 +1295,7 @@ ${commuteTip(best)}` : ''}`;
   #kef a.ajk{color:#3c9ce8;text-decoration:none;font-size:11px;white-space:nowrap}
   #kef a.ajk:hover{text-decoration:underline}
   #kef .new{color:#00ae66;font-weight:600}
+  #kef .dup{font-size:10px;color:#8a9099;border:1px solid #d8dde3;border-radius:3px;padding:0 3px;cursor:help}
   #kef .presets{display:flex;gap:6px;align-items:center;margin:2px 0 6px}
   #kef .presets .k{color:#8a9099;font-size:12px;width:52px}
   #kef td a{color:#1f2329;text-decoration:none}
@@ -1583,7 +1592,7 @@ ${commuteTip(best)}` : ''}`;
       const cls = [m === 'hide' && 'hid', blk && 'blk'].filter(Boolean).join(' ');
       return `
       <tr data-u="${esc(r.url)}" data-g="${esc(groupKey(r))}"${cls ? ` class="${cls}"` : ''}>
-        <td><a href="${esc(r.url)}" target="_blank" title="${esc(r.title)}">${esc(r.community)}</a>${m === 'star' ? ' <span class="star">★</span>' : ''}${blk ? ' <span class="blk-tag">已拉黑</span>' : ''}
+        <td><a href="${esc(r.url)}" target="_blank" title="${esc(r.title)}">${esc(r.community)}</a>${r.dupUrls ? ` <span class="dup" title="同一套房还被挂了 ${r.dupUrls.length} 次：\n${esc(r.dupUrls.join('\n'))}">×${r.dupUrls.length + 1}</span>` : ''}${m === 'star' ? ' <span class="star">★</span>' : ''}${blk ? ' <span class="blk-tag">已拉黑</span>' : ''}
           <div class="sub">${subLine(r)}</div></td>
         ${cols.map((c) => `<td class="${c.num ? 'num' : 'cell'}${c.cls ? ` ${c.cls}` : ''}">${c.v ? c.v(r) : esc(r[c.k] ?? '')}</td>`).join('')}
         <td class="ops"><span class="act${m === 'star' ? ' on' : ''}" data-a="star" title="收藏">${m === 'star' ? '★' : '☆'}</span><span class="act" data-a="hide" title="${m === 'hide' ? '取消隐藏' : '隐藏这套'}">${m === 'hide' ? '↺' : '✕'}</span><span class="act${blk ? ' on' : ''}" data-a="blk" title="${blk ? '移出黑名单' : '拉黑整个小区，以后都不再显示'}">⛔</span></td></tr>`;
@@ -1780,6 +1789,7 @@ ${commuteTip(best)}` : ''}`;
           (p) => st(`安居客：${p.room ? `${p.room}室 ` : ''}第 ${p.page} 页 · 已拿到 ${p.found} / ${p.total} 套 · ${reqCount} 请求`));
         res = { list: aj.list, total: aj.total };
         ajkMsg = aj.total > aj.list.length ? `<br>范围内共 ${aj.total} 套，按最新发布每种户型取前 ${AJK_MAX_PAGES} 页；想看全可以缩小半径。` : '';
+        if (aj.dup) ajkMsg += `<br>${aj.dup} 条是同一套房被重复挂出的（小区、户型、价格、面积都相同），已合并，表格里标「×N」。`;
         if (aj.error) ajkMsg += ` <span class="warn">${esc(aj.error)}，已停在这里${/验证/.test(aj.error) ? '（在页面上按提示完成验证后再查）' : ''}。</span>`;
       } else {
         res = await queryListings(c, box,
@@ -1967,7 +1977,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.7.0',
+        脚本版本: '2.7.1',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
