@@ -1,17 +1,20 @@
 // ==UserScript==
-// @name         贝壳租房筛选助手（面积 / 通勤 / 房龄 / 停车）
+// @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.6.0
-// @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
+// @version      2.7.0
+// @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
 // @match        https://*.anjuke.com/community/*
+// @match        https://*.zu.anjuke.com/ditu*
+// @match        https://*.zu.anjuke.com/map/*
 // @grant        unsafeWindow
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addValueChangeListener
 // @connect      ke.com
+// @connect      anjuke.com
 // @run-at       document-start
 // @homepageURL  https://github.com/zhang-dc/ke-rent-filter
 // @supportURL   https://github.com/zhang-dc/ke-rent-filter/issues
@@ -130,7 +133,10 @@
     if (document.readyState === 'loading') addEventListener('DOMContentLoaded', start); else start();
   }
 
-  if (/(^|\.)anjuke\.com$/.test(location.hostname)) { runAnjuke(); return; }
+  // 安居客租房地图页跑完整面板（数据源换成安居客）；其他安居客页面（小区列表 / 详情）只记录小区信息
+  const IS_AJK_MAP = /(^|\.)zu\.anjuke\.com$/.test(location.hostname) && /^\/(ditu|map)(\/|$)/.test(location.pathname);
+  if (/(^|\.)anjuke\.com$/.test(location.hostname) && !IS_AJK_MAP) { runAnjuke(); return; }
+  const SITE = IS_AJK_MAP ? 'ajk' : 'ke';
 
   // ══════════════════ 1. 页面加载前：记下页面的地图 ══════════════════
   // 这一段跑在 document-start。页面不对外提供地图对象，
@@ -199,6 +205,7 @@
     minPrice: 0, maxPrice: 6000,
     minArea: 60, maxArea: 0,
     maxUnitPrice: 0,
+    ajkRentType: '1', ajkRooms: [],               // 安居客自己的查询条件
     maxBikeMin: 0, maxWalkMin: 0, maxMetroMin: 0, // 通勤分钟上限（满足任一即可），0 = 不限
     rentType: 'Urt200600000001',
     rooms: [], facings: [], floors: [], features: [],
@@ -410,6 +417,97 @@
       if (p < maxPage) await sleep(REQ_DELAY);
     }
     return { list: [...out.values()], total, early, capped: !early && total > HARD_CAP };
+  }
+
+  // ══════════ 4b. 安居客房源：同范围同条件一起查，合进同一张表 ══════════
+  // 安居客地图找房用的接口按经纬度范围返回房源（每页 60 条），户型 / 租金 / 整租合租在服务端过滤，
+  // 面积在本地过滤。没有坐标，按小区名走百度定位，和贝壳房源共用缓存。
+  const AJK_ZU = { 310000: 'sh', 110000: 'bj', 440100: 'gz', 440300: 'sz', 330100: 'hz', 320100: 'nj',
+    510100: 'cd', 420100: 'wh', 500000: 'cq', 120000: 'tj', 320500: 'su', 610100: 'xa' };
+  const AJK_DELAY = 1200;       // 安居客翻页间隔（再加随机 0–800ms），比贝壳更慢一点
+  // 安居客不能按面积排序，范围大时动辄上万套。按最新发布排序（order_id=3），每种户型只取前 N 页：
+  // 新发布的最可能还在租，老房源常常租掉了没下架
+  const AJK_MAX_PAGES = 20;
+  const AJK_ORDER_NEWEST = 3;
+
+  function ajkGetJSON(url) {
+    // 在安居客地图页上就是同源请求，直接 fetch
+    if (SITE === 'ajk') {
+      return rawFetch(url, { credentials: 'include' }).then((r) => r.text()).then((t) => {
+        try { return JSON.parse(t); } catch { throw new Error('安居客要求先完成验证'); }
+      });
+    }
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('没有 GM_xmlhttpRequest'));
+      GM_xmlhttpRequest({
+        method: 'GET', url, timeout: 15000,
+        onload: (r) => {
+          if (/captcha|verify|callback/.test(r.finalUrl || '')) return reject(new Error('安居客要求先完成验证'));
+          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('安居客要求先完成验证')); }   // 返回的不是 JSON，多半是验证页
+        },
+        onerror: () => reject(new Error('网络错误')),
+        ontimeout: () => reject(new Error('超时')),
+      });
+    });
+  }
+
+  function parseAjkRow(p) {
+    const area = parseFloat(p.area) || 0;
+    const price = +p.price || 0;
+    return {
+      source: 'ajk', raw: null,
+      url: `https://${AJK_ZU[cfg.cityId] || 'sh'}.zu.anjuke.com/fangyuan/${p.id}`,
+      title: p.title || '',
+      community: String(p.community_name || '').replace(/[(（](宝山|杨浦|虹口|浦东|闵行|静安|普陀|徐汇|长宁|黄浦|嘉定|松江|青浦|奉贤|金山|崇明)[)）]$/, '').trim(),
+      area, price, unitPrice: area ? Math.round(price / area) : 0,
+      layout: p.rhval || '', facing: p.orient || '', brand: '安居客',
+      cardType: p.rent_type_name || '', tags: [p.fitment, p.block_name].filter(Boolean).join(' '),
+      ajkCommunityUrl: p.community_url || '', ajkCommunityId: p.community_id || null,
+      listedAt: null,
+      lat: null, lng: null, distKm: null, water: '', power: '', elevatorInfo: '',
+    };
+  }
+
+  // 安居客自己的查询条件（和贝壳的编码不通用，单独存）
+  const AJK_VOCAB = {
+    rentType: [['', '不限'], ['1', '整租'], ['2', '合租']],
+    room: [['1', '一室'], ['2', '二室'], ['3', '三室'], ['4', '四室'], ['5', '五室+']],
+  };
+
+  async function queryAnjuke(c, box, onProgress) {
+    const sub = AJK_ZU[c.cityId];
+    if (!sub) return { list: [], total: 0, error: '这个城市还没适配安居客' };
+    const rooms = c.ajkRooms.length ? c.ajkRooms.map(Number) : [0];   // 接口一次只能查一种户型，逐个查；不选 = 不限
+    const rentType = +c.ajkRentType || 0;
+    const out = new Map();
+    let total = 0, error = '';
+    try {
+      for (const room of rooms) {
+        for (let p = 1; p <= AJK_MAX_PAGES; p++) {
+          if (abort) break;
+          const url = `https://${sub}.zu.anjuke.com/map/ajax/pclist/Api_get_house_list?${qs({
+            p, maxp: 99, room_num: room >= 5 ? 5 : room, price_id: 0, rent_type: rentType,
+            price_min: c.minPrice || 0, price_max: c.maxPrice || 0, lx_id: '', tag_id: '', orient_id: '', order_id: AJK_ORDER_NEWEST,
+            lat: `${box.minLatitude.toFixed(6)}_${box.maxLatitude.toFixed(6)}`,
+            lng: `${box.minLongitude.toFixed(6)}_${box.maxLongitude.toFixed(6)}`, zoom: 15, kw: '' })}`;
+          reqCount++;
+          const j = await ajkGetJSON(url);
+          if (j.code !== 0 && j.code !== '0') throw new Error(`安居客返回 ${j.code} ${j.msg || ''}`);
+          const props = (j.val && j.val.props) || [];
+          const pages = (j.val && j.val.pages) || {};
+          if (p === 1) total += +pages.total || 0;
+          for (const raw of props) {
+            const r = parseAjkRow(raw);
+            if (!out.has(r.url)) out.set(r.url, r);
+          }
+          onProgress?.({ found: out.size, total, page: p, room });
+          if (!props.length || p * (+pages.page_size || 60) >= (+pages.total || 0)) break;
+          await sleep(AJK_DELAY + Math.random() * 800);
+        }
+        if (abort) break;
+      }
+    } catch (e) { error = e.message; }
+    return { list: [...out.values()], total, error };
   }
 
   // ══════════ 5. 坐标：小区名 → 经纬度（百度地图） ══════════
@@ -665,9 +763,12 @@
 
   function applyAjk(list, c) {
     const memo = new Map();
+    // 安居客房源自带小区 ID，先按 ID 精确对上记录过的小区，对不上再按名字
+    const byId = new Map(Object.values(ajkDb).map((v) => [(String(v.url || '').match(/view\/(\d+)/) || [])[1], v]).filter(([id]) => id));
     for (const r of list) {
       if (!memo.has(r.community)) memo.set(r.community, findAjk(r.community, c.cityId));
-      const e = memo.get(r.community);
+      const e = (r.ajkCommunityId && byId.get(String(r.ajkCommunityId))) || memo.get(r.community)
+        || (r.ajkCommunityUrl ? { url: r.ajkCommunityUrl } : null);       // 没记录过也至少能跳到安居客小区页
       r.ajk = e || null;
       r.year = (e && e.year) || null;
       r.ajkParkSpots = (e && e.extra && e.extra['停车位']) || '';
@@ -715,7 +816,9 @@
   function routeOnce(kind, from, to) {
     return new Promise((resolve) => {
       const NS = W.BMap;
-      const Ctor = NS && { bike: NS.RidingRoute, walk: NS.WalkingRoute, metro: NS.TransitRoute }[kind];
+      // 安居客页面上是百度地图 2.0，没有骑行路线：用步行路线的路程按骑车速度折算（路程两者差不多）
+      const bikeByWalk = kind === 'bike' && NS && !NS.RidingRoute;
+      const Ctor = NS && { bike: bikeByWalk ? NS.WalkingRoute : NS.RidingRoute, walk: NS.WalkingRoute, metro: NS.TransitRoute }[kind];
       if (!Ctor || !geoMap) return resolve(null);
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
@@ -726,7 +829,9 @@
               if (!rs) return finish(null);
               if (kind !== 'metro') {
                 const p = rs.getPlan(0);
-                return finish(p ? { dist: p.getDistance(false), sec: p.getDuration(false) } : null);
+                if (!p) return finish(null);
+                const dist = p.getDistance(false);
+                return finish(bikeByWalk ? { dist, sec: Math.round(dist / BIKE_MPS), est: true } : { dist, sec: p.getDuration(false) });
               }
               finish(bestMetroPlan(rs));
             } catch { finish(null); }
@@ -818,7 +923,7 @@
   function commuteTip(r) {
     const e = r.commute;
     if (!e) return '';
-    const f = (x, label) => (x && x.sec != null ? `${label} ${Math.round(x.sec / 60)} 分钟${x.dist ? `（${(x.dist / 1000).toFixed(1)}km）` : ''}` : `${label} ${x && x.far ? '太远' : '无'}`);
+    const f = (x, label) => (x && x.sec != null ? `${label} ${Math.round(x.sec / 60)} 分钟${x.dist ? `（${(x.dist / 1000).toFixed(1)}km${x.est ? '，按步行路线折算' : ''}）` : ''}` : `${label} ${x && x.far ? '太远' : '无'}`);
     return [f(e.bike, '自行车'), f(e.walk, '步行'), e.metro && e.metro.sec != null ? `地铁+自行车 ${Math.round(e.metro.sec / 60)} 分钟（${e.metro.lines}）` : `地铁+自行车 ${e.metro && e.metro.far ? '太远' : '无纯地铁方案'}`].join('\n');
   }
 
@@ -826,7 +931,7 @@
   // all 是查询全集，rows 是视图。每次都从 all 重算，条件随便收紧再放宽，不发请求。
   // 只有放宽到查询范围之外（面积下限、租金、半径、锚点）才需要重新查询，面板会提示。
   const marks = GM_getValue('kef-marks', {});            // url → 'star' | 'hide'，跨会话保留
-  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], kw: '', exkw: '',
+  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [], kw: '', exkw: '',
     onlyStar: false, showHidden: false, onlyLocated: false, noComm: false };
   const vf = Object.assign({}, VF_DEFAULT, GM_getValue('kef-vf', {}));
   let focus = null;                                      // 地图上点中的小区，表格只看它
@@ -845,6 +950,7 @@
     ['parks', '停车', (r) => r.parkLevel || '未查'],
     ['ages', '房龄', ageOf],
     ['listed', '上架', listedOf],
+    ['facings', '朝向', (r) => String(r.facing || '').replace(/朝|\s/g, '') || '未知'],
   ];
   const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏/拉黑']];
 
@@ -909,7 +1015,9 @@
   function restoreResult() {
     const s = lastResult;
     if (!s || !Array.isArray(s.all) || !s.all.length) return null;
-    all = s.all; queryCfg = s.queryCfg || null;
+    all = s.all.filter((r) => (r.source || 'ke') === SITE);          // 只要本平台的（旧版本曾把安居客合进贝壳）
+    if (!all.length) return null;
+    queryCfg = s.queryCfg || null;
     recomputeDist();
     applyParking(all, cfg);
     applyAjk(all, cfg);
@@ -1224,7 +1332,7 @@ ${commuteTip(best)}` : ''}`;
 
   function panelHTML() {
     return `
-    <header><span>贝壳租房 · 筛选面板</span><span><button id="kef-wide" title="宽表：楼层 / 电梯 / 停车 / 水电 / 入住 / 标签 各占一列">⇔</button><button id="kef-min">—</button></span></header>
+    <header><span>${SITE === 'ajk' ? '安居客租房' : '贝壳租房'} · 筛选面板</span><span><button id="kef-wide" title="宽表：楼层 / 电梯 / 停车 / 水电 / 入住 / 标签 各占一列">⇔</button><button id="kef-min">—</button></span></header>
     <div class="body">
       <div class="row">
         <label class="k">面积≥</label><input type="number" id="f-amin" value="${cfg.minArea}">
@@ -1242,13 +1350,16 @@ ${commuteTip(best)}` : ''}`;
         <label class="k">电梯</label><select id="f-ele">${VOCAB.elevator.map(([v, t]) => `<option value="${v}"${cfg.elevator === v ? ' selected' : ''}>${t}</option>`).join('')}</select>
       </div>
       <div class="presets"><span class="k">预设</span><span class="chip" id="b-preset-bd" title="自行车≤20 / 步行≤30 / 地铁+自行车≤20 分钟，满足任一">字节房补</span></div>
-      <details id="query-opts" open><summary>贝壳官方条件（改了要重新 ① 查询）</summary>
+      ${SITE === 'ajk' ? `<details id="query-opts" open><summary>安居客查询条件（改了要重新 ① 查询；朝向在下面结果筛选里筛）</summary>
+        <div class="grp">方式</div><div class="chips">${chips('ajkRentType', AJK_VOCAB.rentType, cfg.ajkRentType)}</div>
+        <div class="grp">户型（不选=不限）</div><div class="chips">${chips('ajkRooms', AJK_VOCAB.room, cfg.ajkRooms)}</div>
+      </details>` : `<details id="query-opts" open><summary>贝壳官方条件（改了要重新 ① 查询）</summary>
         <div class="grp">方式</div><div class="chips">${chips('rentType', VOCAB.rentType, cfg.rentType)}</div>
         <div class="grp">户型（不选=不限）</div><div class="chips">${chips('rooms', VOCAB.room, cfg.rooms)}</div>
         <div class="grp">朝向</div><div class="chips">${chips('facings', VOCAB.facing, cfg.facings)}</div>
         <div class="grp">楼层</div><div class="chips">${chips('floors', VOCAB.floor, cfg.floors)}</div>
         <div class="grp">亮点</div><div class="chips">${chips('features', VOCAB.feature, cfg.features)}</div>
-      </details>
+      </details>`}
       <div class="acts">
         <button class="primary" id="b-run">① 查询</button>
         <button class="ghost" id="b-geo" title="解析小区坐标，得到精确距离">② 定位</button>
@@ -1258,7 +1369,7 @@ ${commuteTip(best)}` : ''}`;
       <div class="acts">
         <button class="ghost" id="b-park" title="按小区查百度 POI：小区自有停车场（地下/地上）、最近公共停车场距离。数据来自百度地图，有缓存">🅿 查停车</button>
         <button class="ghost" id="b-commute" title="按百度路线规划算每个小区到锚点的自行车 / 步行 / 地铁+自行车时间，有缓存">🚲 通勤</button>
-        <button class="ghost" id="b-detail" title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
+        <button class="ghost" id="b-detail"${SITE === 'ajk' ? ' style="display:none"' : ''} title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
         <button class="ghost" id="b-csv">导出 CSV</button>
       </div>
       <div class="status" id="st">面积和半径是贝壳没有的维度。按 ①②③ 顺序点。</div>
@@ -1480,7 +1591,7 @@ ${commuteTip(best)}` : ''}`;
   }
 
   function exportCSV() {
-    const cols = ['community', 'title', 'area', 'layout', 'facing', 'price', 'unitPrice', 'distKm', 'floor', 'elevatorInfo',
+    const cols = ['source', 'community', 'title', 'area', 'layout', 'facing', 'price', 'unitPrice', 'distKm', 'floor', 'elevatorInfo',
       'bikeMin', 'walkMin', 'metroMin', 'listedDate', 'year', 'parkLabel', 'parkNear', 'carSpot', 'ajkParkSpots', 'ajkParkFee', 'water', 'power', 'gas', 'heating', 'checkin', 'lease', 'brand', 'cardType', 'tags', 'star', 'url'];
     const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
     const csv = '﻿' + [cols.join(','), ...rows.map((r) => cols.map((c) => q(c === 'star' ? (marks[r.url] === 'star' ? '★' : '') : c === 'listedDate' ? (r.listedAt ? ymd(r.listedAt) : '') : r[c])).join(','))].join('\n');
@@ -1534,9 +1645,9 @@ ${commuteTip(best)}` : ''}`;
     el.querySelectorAll('.chip[data-n]').forEach((c) => {
       c.onclick = () => {
         const n = c.dataset.n, v = c.dataset.v;
-        if (n === 'rentType') {
-          el.querySelectorAll('[data-n="rentType"]').forEach((x) => x.classList.remove('on'));
-          c.classList.add('on'); cfg.rentType = v;
+        if (n === 'rentType' || n === 'ajkRentType') {                  // 单选
+          el.querySelectorAll(`[data-n="${n}"]`).forEach((x) => x.classList.remove('on'));
+          c.classList.add('on'); cfg[n] = v;
         } else {
           c.classList.toggle('on');
           cfg[n] = [...el.querySelectorAll(`[data-n="${n}"].on`)].map((x) => x.dataset.v);
@@ -1564,7 +1675,7 @@ ${commuteTip(best)}` : ''}`;
       } else if (t.id === 'v-unfocus') {
         focusGroup(focus); return;
       } else if (t.id === 'v-reset') {
-        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [] });
+        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [] });
         el.querySelector('#v-kw').value = ''; el.querySelector('#v-ex').value = '';
         focus = null;
       }
@@ -1661,9 +1772,20 @@ ${commuteTip(best)}` : ''}`;
       const c = readUI();
       reqCount = 0;
       const t0 = performance.now();
-      const res = await queryListings(c, radiusToBBox(c.anchorLat, c.anchorLng, c.radiusKm),
-        (p) => st(`面积降序第 ${p.page} 页 · 命中 <b>${p.found}</b> / 候选 ${p.total} · ${reqCount} 请求`));
-      all = res.list;
+      const box = radiusToBBox(c.anchorLat, c.anchorLng, c.radiusKm);
+      let res, ajkMsg = '';
+      if (SITE === 'ajk') {
+        // 安居客：不能按面积排序，按最新发布取前 N 页，面积和半径在本地筛
+        const aj = await queryAnjuke(c, box,
+          (p) => st(`安居客：${p.room ? `${p.room}室 ` : ''}第 ${p.page} 页 · 已拿到 ${p.found} / ${p.total} 套 · ${reqCount} 请求`));
+        res = { list: aj.list, total: aj.total };
+        ajkMsg = aj.total > aj.list.length ? `<br>范围内共 ${aj.total} 套，按最新发布每种户型取前 ${AJK_MAX_PAGES} 页；想看全可以缩小半径。` : '';
+        if (aj.error) ajkMsg += ` <span class="warn">${esc(aj.error)}，已停在这里${/验证/.test(aj.error) ? '（在页面上按提示完成验证后再查）' : ''}。</span>`;
+      } else {
+        res = await queryListings(c, box,
+          (p) => st(`面积降序第 ${p.page} 页 · 命中 <b>${p.found}</b> / 候选 ${p.total} · ${reqCount} 请求`));
+      }
+      all = res.list.map((r) => Object.assign(r, { source: SITE }));
       // 坐标 / 停车按小区、详情按房源，缓存里有的直接带上，不发请求
       queryCfg = { ...c };                               // applyGeo 要用新的查询范围校验坐标
       applyGeo(all, c);
@@ -1679,6 +1801,7 @@ ${commuteTip(best)}` : ''}`;
       if (res.early) msg += ' · 降序提前收工';
       if (abort) msg += ' <span class="warn">· 已中止</span>';
       if (res.capped) msg += ' <span class="warn">· 触及 1000 条上限，建议缩半径或提高面积下限</span>';
+      msg += ajkMsg;
       const located = all.filter((r) => r.lng != null).length;
       const parked = all.filter((r) => r.parkLabel).length;
       msg += `<br>缓存命中：坐标 ${located} 套 · 停车 ${parked} 套 · 详情 ${nDetail} 套。`;
@@ -1705,7 +1828,7 @@ ${commuteTip(best)}` : ''}`;
         mapSync = false;
         clearOverlays(); setMapBtn(); renderLegend();
         try { mapInstance.panBy(1, 0); } catch {}       // 触发一次 moveend，让原生气泡回来
-        return st('已还原贝壳原生地图。');
+        return st(`已还原${SITE === 'ajk' ? '安居客' : '贝壳'}原生地图。`);
       }
       if (!all.length) return st('<span class="warn">还没有数据：先点「① 查询」，再点「② 定位」。</span>');
       if (!rows.length) return st('<span class="warn">当前筛选结果是 0 套，放宽一下结果筛选。</span>');
@@ -1721,7 +1844,7 @@ ${commuteTip(best)}` : ''}`;
     el.querySelector('#b-detail').onclick = guard('b-detail', async () => {
       if (!rows.length) return st('先点「① 查询」');
       // 只补当前视图里还没补过的，可以中途停下、下次接着来
-      const todo = rows.filter((r) => !r.detailed);
+      const todo = rows.filter((r) => !r.detailed && r.source !== 'ajk');   // 安居客详情页结构不同，不补
       if (!todo.length) return st('当前显示的房源都已补全过详情。');
       let dead = 0, failed = 0, captcha = false, i = 0;
       for (; i < todo.length; i++) {
@@ -1844,7 +1967,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.6.0',
+        脚本版本: '2.7.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
