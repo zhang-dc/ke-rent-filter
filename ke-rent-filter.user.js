@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贝壳租房筛选助手（面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.5.0
+// @version      2.6.0
 // @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -579,10 +579,11 @@
   function applyParking(list, c) {
     for (const r of list) {
       const p = parkCache.get(`${c.cityId}:${r.community}`);
-      if (!p) { r.park = null; r.parkLabel = ''; r.parkNear = null; continue; }
+      if (!p) { r.park = null; r.parkLabel = ''; r.parkNear = null; setParkLevel(r); continue; }
       r.park = p;
       r.parkLabel = p.own.includes('地下') ? '地下车库' : p.own ? '小区地上' : '无小区车场';
       r.parkNear = p.near;
+      setParkLevel(r);
     }
   }
 
@@ -671,7 +672,29 @@
       r.year = (e && e.year) || null;
       r.ajkParkSpots = (e && e.extra && e.extra['停车位']) || '';
       r.ajkParkFee = (e && e.extra && e.extra['停车费']) || '';
+      r.parkRatio = parkRatioOf(e && e.extra);
+      setParkLevel(r);
     }
+  }
+
+  // 车位比：安居客写成「130(1:0.4)」；没写比例时用 车位数 / 总户数 算
+  function parkRatioOf(extra) {
+    if (!extra) return null;
+    const s = extra['停车位'] || '';
+    // 有车位数和户数就自己算：网站写的比例只保留一位小数，32/1290 会写成「1:0.0」
+    const spots = +(s.match(/^\s*(\d+)/) || [])[1];
+    const hh = +((extra['总户数'] || '').match(/\d+/) || [])[0];
+    if (spots > 0 && hh > 0) return +(spots / hh).toFixed(2);
+    const m = s.match(/1\s*[:：]\s*([\d.]+)/);
+    return m ? +(+m[1]).toFixed(2) : null;
+  }
+
+  // 停车档位：有车位比按车位比分；没有就只能说「有车场·车位未知」
+  function setParkLevel(r) {
+    if (r.parkRatio != null) r.parkLevel = r.parkRatio >= 0.8 ? '车位充足' : r.parkRatio >= 0.4 ? '车位一般' : '车位紧张';   // 不是每户都有车，0.4 已算过得去
+    else if (r.parkLabel === '无小区车场') r.parkLevel = '无小区车场';
+    else if (r.parkLabel) r.parkLevel = r.parkLabel === '地下车库' ? '有地下车库·车位未知' : '有车场·车位未知';
+    else r.parkLevel = '';
   }
 
   const ageOf = (r) => (!r.year ? '房龄未知' : r.year >= 2015 ? '2015年后' : r.year >= 2010 ? '2010–2014' : r.year >= 2000 ? '2000–2009' : '2000年前');
@@ -819,7 +842,7 @@
     ['rooms', '居室', roomOf],
     ['types', '类型', (r) => r.cardType || '其他'],
     ['brands', '品牌', (r) => r.brand || '其他'],
-    ['parks', '停车', (r) => r.parkLabel || '未查'],
+    ['parks', '停车', (r) => r.parkLevel || '未查'],
     ['ages', '房龄', ageOf],
     ['listed', '上架', listedOf],
   ];
@@ -1101,6 +1124,7 @@ ${commuteTip(best)}` : ''}`;
   #kef .park-good{color:#00ae66;font-weight:600}
   #kef .park-ok{color:#3c9ce8}
   #kef .park-no{color:#a8adb3}
+  #kef .park-bad{color:#f54a45}
   #kef .body{padding:11px 13px 13px;overflow:auto}
   #kef .row{display:grid;grid-template-columns:52px 1fr 52px 1fr;gap:6px 7px;align-items:center;margin-bottom:6px}
   #kef label.k{color:#8a9099;font-size:12px;white-space:nowrap}
@@ -1286,7 +1310,8 @@ ${commuteTip(best)}` : ''}`;
       for (const r of all) if (viewPass(r, k)) { const v = fn(r); cnt.set(v, (cnt.get(v) || 0) + 1); }
       for (const v of vf[k]) if (!cnt.has(v)) cnt.set(v, 0);
       if (cnt.size <= 1 && !vf[k].length) return '';           // 只有一种取值，没得筛
-      const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'], listed: ['7天内', '30天内', '90天内', '更早', '上架未知'] };
+      const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'], listed: ['7天内', '30天内', '90天内', '更早', '上架未知'],
+        parks: ['车位充足', '车位一般', '车位紧张', '有地下车库·车位未知', '有车场·车位未知', '无小区车场', '未查'] };
       const items = [...cnt].sort((a, b) => (ORDER[k] ? ORDER[k].indexOf(a[0]) - ORDER[k].indexOf(b[0]) : k === 'rooms' ? a[0].localeCompare(b[0], 'zh') : b[1] - a[1]));
       return `<div class="frow"><span class="fk">${name}</span>${items.map(([v, c]) =>
         `<span class="chip${vf[k].includes(v) ? ' on' : ''}" data-f="${k}" data-v="${esc(v)}">${esc(v)} <i>${c}</i></span>`).join('')}</div>`;
@@ -1346,7 +1371,7 @@ ${commuteTip(best)}` : ''}`;
     { k: 'year', t: '竣工', num: true, v: (r) => (r.year ? `<span class="${r.year >= 2010 ? 'new' : ''}">${r.year}</span>` : ajkLink(r, '查')) },
     { k: 'floor', t: '楼层', wide: true },
     { k: 'elevatorInfo', t: '电梯', wide: true },
-    { k: 'parkLabel', t: '小区停车', wide: true, v: (r) => parkHTML(r) },
+    { k: 'parkRatio', t: '车位比', wide: true, num: true, desc: true, v: (r) => parkHTML(r) },
     { k: 'parkNear', t: '最近车场', num: true, wide: true, v: (r) => (r.parkNear != null ? `${r.parkNear}m` : '') },
     { k: 'carSpot', t: '车位', wide: true },
     { k: 'ajkParkSpots', t: '车位数', wide: true },
@@ -1382,14 +1407,25 @@ ${commuteTip(best)}` : ''}`;
     return `<span class="${max > 0 && v <= max ? 'new' : ''}"${tip ? ` title="${esc(tip)}"` : ''}>${v}′</span>`;
   }
 
+  // 有车位比（安居客）就按车位比显示；没有就退回百度的「有没有车场」，并明说车位数未知
   function parkHTML(r) {
-    const label = r.parkLabel;
-    if (!label) return '';
-    const cls = label === '地下车库' ? 'park-good' : label === '小区地上' ? 'park-ok' : 'park-no';
+    const level = r.parkLevel;
+    if (!level) return '';
+    const cls = level === '车位充足' ? 'park-good' : level === '车位一般' ? 'park-ok' : level === '车位紧张' ? 'park-bad' : 'park-no';
+    const tip = [];
+    if (r.parkRatio != null) {
+      tip.push(`车位比 1:${r.parkRatio}（每户 ${r.parkRatio} 个车位，来自安居客）`);
+      if (r.ajkParkSpots) tip.push(`停车位：${r.ajkParkSpots}`);
+      if (r.ajk && r.ajk.extra && r.ajk.extra['总户数']) tip.push(`总户数：${r.ajk.extra['总户数']}`);
+      if (r.ajkParkFee) tip.push(`停车费：${r.ajkParkFee}`);
+    } else {
+      tip.push('车位数未知：百度地图只能看出有没有停车场，看不出车位够不够。在安居客打开小区详情页会记下车位比');
+    }
     const names = (r.park && r.park.ownNames) || [];
-    const tip = (names.length ? names.join('\n') : '百度地图上没找到以小区名命名的停车场')
-      + (r.park ? `\n周边 ${PARK_RADIUS}m 内停车场 ${r.park.count} 个` : '');
-    return `<span class="${cls}" title="${esc(tip)}">${esc(label)}</span>`;
+    if (names.length) tip.push('百度地图上的小区停车场：' + names.join('、'));
+    if (r.park) tip.push(`周边 ${PARK_RADIUS}m 内停车场 ${r.park.count} 个`);
+    const text = r.parkRatio != null ? `1:${r.parkRatio} ${level.replace('车位', '')}` : level;
+    return `<span class="${cls}" title="${esc(tip.join('\n'))}">${esc(text)}</span>`;
   }
 
   // 安居客小区页：房龄、停车费、车位数在那边。点开浏览时脚本会顺手记下（见第 0 节）
@@ -1408,7 +1444,7 @@ ${commuteTip(best)}` : ''}`;
     if (!wide) {
       if (r.floor) bits.push(esc(r.floor));
       if (r.elevatorInfo) bits.push(`电梯${esc(r.elevatorInfo)}`);
-      if (r.parkLabel) bits.push(`🅿${parkHTML(r)}${r.parkNear != null ? ` ${r.parkNear}m` : ''} ${ajkLink(r)}`);
+      if (r.parkLevel) bits.push(`🅿${parkHTML(r)} ${ajkLink(r)}`);
       if (r.carSpot) bits.push(`车位${esc(r.carSpot)}`);
       if (r.water === '商水') bits.push('<span class="hot">商水商电</span>');
     }
@@ -1808,7 +1844,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.5.0',
+        脚本版本: '2.6.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
