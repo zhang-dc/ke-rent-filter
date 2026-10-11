@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贝壳租房筛选助手（面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.4.1
+// @version      2.5.0
 // @description  帮租客和租赁中介整理、比较贝壳地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -315,6 +315,21 @@
 
   // 标题「整租·控江四村 2室2厅」→「控江四村」。公寓类标题是一整句广告
   //（「整租·城投宽庭 江湾社区 新E2户型 66平 …」），只取第一个词当小区名，否则定位、分组都对不上
+  // 上架时间：列表接口里没有，但房源编号（SH2218300938802692096）是按时间生成的 ID，
+  // 高位是从 2010-01-01 起的毫秒数。实测带「新上」标签的房源解出来中位数 10 天前、没有晚于今天的，能精确到天。
+  // 这是编号生成的时间（≈首次挂牌）；下架后重新上架沿用老编号的，会显示得比较早。
+  const ID_EPOCH = Date.UTC(2010, 0, 1);
+  function listedAtOf(url) {
+    const m = String(url || '').match(/\/[A-Z]{2}(\d{15,})\.html/);
+    if (!m) return null;
+    try {
+      const t = Number(BigInt(m[1]) >> 22n) + ID_EPOCH;
+      return t > Date.UTC(2015, 0, 1) && t < Date.now() + 864e5 ? t : null;   // 编号规则不同的（解出未来时间）当未知
+    } catch { return null; }
+  }
+  const listedAgo = (r) => (r.listedAt ? Math.floor((Date.now() - r.listedAt) / 864e5) : null);
+  const listedOf = (r) => { const d = listedAgo(r); return d == null ? '上架未知' : d <= 7 ? '7天内' : d <= 30 ? '30天内' : d <= 90 ? '90天内' : '更早'; };
+
   function communityOf(title) {
     const s = (title.split('·')[1] || title).replace(/\s+\d+室.*$/, '').trim();
     const words = s.split(/\s+/);
@@ -336,6 +351,7 @@
       layout: p[1] || '', facing: p[2] || '', brand: p[3] || '',
       cardType: r.cardType || '',
       tags: (r.tags || []).map((t) => t.desc).join(' '),
+      listedAt: listedAtOf(r.actionUrl),
       lat: null, lng: null, distKm: null, water: '', power: '', elevatorInfo: '',
     };
   }
@@ -787,7 +803,7 @@
   // all 是查询全集，rows 是视图。每次都从 all 重算，条件随便收紧再放宽，不发请求。
   // 只有放宽到查询范围之外（面积下限、租金、半径、锚点）才需要重新查询，面板会提示。
   const marks = GM_getValue('kef-marks', {});            // url → 'star' | 'hide'，跨会话保留
-  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], kw: '', exkw: '',
+  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], kw: '', exkw: '',
     onlyStar: false, showHidden: false, onlyLocated: false, noComm: false };
   const vf = Object.assign({}, VF_DEFAULT, GM_getValue('kef-vf', {}));
   let focus = null;                                      // 地图上点中的小区，表格只看它
@@ -805,6 +821,7 @@
     ['brands', '品牌', (r) => r.brand || '其他'],
     ['parks', '停车', (r) => r.parkLabel || '未查'],
     ['ages', '房龄', ageOf],
+    ['listed', '上架', listedOf],
   ];
   const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏/拉黑']];
 
@@ -874,6 +891,7 @@
     applyParking(all, cfg);
     applyAjk(all, cfg);
     applyCommute(all, cfg);
+    for (const r of all) if (r.listedAt === undefined) r.listedAt = listedAtOf(r.url);   // 老版本存的结果没有这个字段
     applyDetail(all, cfg);
     return s;
   }
@@ -1268,7 +1286,7 @@ ${commuteTip(best)}` : ''}`;
       for (const r of all) if (viewPass(r, k)) { const v = fn(r); cnt.set(v, (cnt.get(v) || 0) + 1); }
       for (const v of vf[k]) if (!cnt.has(v)) cnt.set(v, 0);
       if (cnt.size <= 1 && !vf[k].length) return '';           // 只有一种取值，没得筛
-      const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'] };
+      const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'], listed: ['7天内', '30天内', '90天内', '更早', '上架未知'] };
       const items = [...cnt].sort((a, b) => (ORDER[k] ? ORDER[k].indexOf(a[0]) - ORDER[k].indexOf(b[0]) : k === 'rooms' ? a[0].localeCompare(b[0], 'zh') : b[1] - a[1]));
       return `<div class="frow"><span class="fk">${name}</span>${items.map(([v, c]) =>
         `<span class="chip${vf[k].includes(v) ? ' on' : ''}" data-f="${k}" data-v="${esc(v)}">${esc(v)} <i>${c}</i></span>`).join('')}</div>`;
@@ -1319,11 +1337,12 @@ ${commuteTip(best)}` : ''}`;
     { k: 'area', t: '㎡', num: true },
     { k: 'price', t: '月租', num: true },
     { k: 'unitPrice', t: '元/㎡', num: true },
-    { k: 'distKm', t: 'km', num: true },
+    { k: 'distKm', t: 'km', num: true, wide: true },
     { k: 'commuteBest', t: '通勤', num: true, v: (r) => commuteCell(r) },
     { k: 'bikeMin', t: '自行车', num: true, wide: true, v: (r) => minCell(r.bikeMin, cfg.maxBikeMin) },
     { k: 'walkMin', t: '步行', num: true, wide: true, v: (r) => minCell(r.walkMin, cfg.maxWalkMin) },
     { k: 'metroMin', t: '地铁+骑', num: true, wide: true, v: (r) => minCell(r.metroMin, cfg.maxMetroMin, r.commute && r.commute.metro && r.commute.metro.lines) },
+    { k: 'listedAt', t: '上架', num: true, desc: true, v: (r) => listedCell(r) },
     { k: 'year', t: '竣工', num: true, v: (r) => (r.year ? `<span class="${r.year >= 2010 ? 'new' : ''}">${r.year}</span>` : ajkLink(r, '查')) },
     { k: 'floor', t: '楼层', wide: true },
     { k: 'elevatorInfo', t: '电梯', wide: true },
@@ -1348,6 +1367,16 @@ ${commuteTip(best)}` : ''}`;
     const ok = (cfg.maxBikeMin || cfg.maxWalkMin || cfg.maxMetroMin) && commuteOK(r, cfg);
     return `<span class="${ok ? 'new' : ''}" title="${esc(commuteTip(r))}">${mode}${r.commuteBest}′</span>`;
   }
+  const ymd = (t) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+  // 今年的显示「10-05」，往年的显示「2023-06」；7 天内标绿
+  function listedCell(r) {
+    if (!r.listedAt) return '';
+    const days = listedAgo(r);
+    const full = ymd(r.listedAt);
+    const text = new Date(r.listedAt).getFullYear() === new Date().getFullYear() ? full.slice(5) : full.slice(0, 7);
+    return `<span class="${days <= 7 ? 'new' : ''}" title="${full}，约 ${days} 天前（由房源编号推算的首次挂牌时间）">${text}</span>`;
+  }
+
   function minCell(v, max, tip) {
     if (v == null) return '';
     return `<span class="${max > 0 && v <= max ? 'new' : ''}"${tip ? ` title="${esc(tip)}"` : ''}>${v}′</span>`;
@@ -1416,9 +1445,9 @@ ${commuteTip(best)}` : ''}`;
 
   function exportCSV() {
     const cols = ['community', 'title', 'area', 'layout', 'facing', 'price', 'unitPrice', 'distKm', 'floor', 'elevatorInfo',
-      'bikeMin', 'walkMin', 'metroMin', 'year', 'parkLabel', 'parkNear', 'carSpot', 'ajkParkSpots', 'ajkParkFee', 'water', 'power', 'gas', 'heating', 'checkin', 'lease', 'brand', 'cardType', 'tags', 'star', 'url'];
+      'bikeMin', 'walkMin', 'metroMin', 'listedDate', 'year', 'parkLabel', 'parkNear', 'carSpot', 'ajkParkSpots', 'ajkParkFee', 'water', 'power', 'gas', 'heating', 'checkin', 'lease', 'brand', 'cardType', 'tags', 'star', 'url'];
     const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
-    const csv = '﻿' + [cols.join(','), ...rows.map((r) => cols.map((c) => q(c === 'star' ? (marks[r.url] === 'star' ? '★' : '') : r[c])).join(','))].join('\n');
+    const csv = '﻿' + [cols.join(','), ...rows.map((r) => cols.map((c) => q(c === 'star' ? (marks[r.url] === 'star' ? '★' : '') : c === 'listedDate' ? (r.listedAt ? ymd(r.listedAt) : '') : r[c])).join(','))].join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
     a.download = `贝壳-${cfg.minArea}平以上-${cfg.maxPrice}以内-${rows.length}套.csv`;
@@ -1499,7 +1528,7 @@ ${commuteTip(best)}` : ''}`;
       } else if (t.id === 'v-unfocus') {
         focusGroup(focus); return;
       } else if (t.id === 'v-reset') {
-        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [] });
+        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [] });
         el.querySelector('#v-kw').value = ''; el.querySelector('#v-ex').value = '';
         focus = null;
       }
@@ -1520,7 +1549,7 @@ ${commuteTip(best)}` : ''}`;
       const th = e.target.closest('th[data-k]');
       if (!th) return;
       const k = th.dataset.k;
-      if (sortKey === k) sortAsc = !sortAsc; else { sortKey = k; sortAsc = true; }
+      if (sortKey === k) sortAsc = !sortAsc; else { sortKey = k; sortAsc = !(COLS.find((c) => c.k === k) || {}).desc; }   // 上架这类默认新的在前
       renderTable();
     });
 
@@ -1779,7 +1808,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.4.1',
+        脚本版本: '2.5.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
