@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.7.1
+// @version      2.7.2
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -986,6 +986,33 @@
     return true;
   }
 
+  // 被筛掉的原因（和 viewPass 同一套顺序），聚焦小区时告诉用户「另有几套被什么条件筛掉了」
+  function hiddenReason(r) {
+    const m = marks[r.url];
+    if (m === 'hide' && !vf.showHidden) return '手动隐藏';
+    if (!vf.showHidden && isBlk(r)) return '拉黑';
+    if (vf.onlyStar && m !== 'star') return '只看★';
+    if (cfg.minArea > 0 && r.area < cfg.minArea) return '面积';
+    if (cfg.maxArea > 0 && r.area > cfg.maxArea) return '面积';
+    if ((cfg.minPrice > 0 && r.price < cfg.minPrice) || (cfg.maxPrice > 0 && r.price > cfg.maxPrice)) return '租金';
+    if (cfg.maxUnitPrice > 0 && r.unitPrice > cfg.maxUnitPrice) return '单价';
+    if (r.distKm != null && cfg.radiusKm > 0 && r.distKm > cfg.radiusKm) return '半径';
+    if (!commuteOK(r, cfg)) return '通勤';
+    for (const [k, name, fn] of FACETS) if (vf[k].length && !vf[k].includes(fn(r))) return name;
+    if (!viewPass(r)) return '其他条件';
+    return '';
+  }
+
+  // 结果筛选里正在生效的条件，一行写出来，免得忘了自己勾过什么
+  function activeFilters() {
+    const out = FACETS.filter(([k]) => vf[k].length).map(([k, name]) => `${name}=${vf[k].join('/')}`);
+    if (vf.kw) out.push(`包含「${vf.kw}」`);
+    if (vf.exkw) out.push(`排除「${vf.exkw}」`);
+    for (const [k, t] of TOGGLES) if (vf[k] && k !== 'showHidden') out.push(t);
+    return out;
+  }
+  let focusAll = false;         // 聚焦小区时，临时把被筛掉的也列出来
+
   // 本地视图只能在查到的范围里收紧，放宽到范围外的部分要重新查询
   function loosened() {
     const a = queryCfg;
@@ -1210,6 +1237,7 @@ ${commuteTip(best)}` : ''}`;
   function focusGroup(k) {
     if (focus) hlPin(focus, false);
     focus = focus === k ? null : k;
+    focusAll = false;
     if (focus) hlPin(focus, true);
     $('kef')?.classList.remove('min');
     renderTable(); renderNote();
@@ -1467,10 +1495,20 @@ ${commuteTip(best)}` : ''}`;
     if (nHide) h += ` · 已隐藏 ${nHide}`;
     if (nBlk) h += ` · 拉黑小区里 ${nBlk} 套`;
     h += blkHTML();
+    const af = activeFilters();
+    if (af.length) h += `<br><span class="sub">结果筛选生效中：${esc(af.join(' · '))}</span>`;
     if (focus) {
       const n = rows.filter((r) => groupKey(r) === focus).length;
-      h += `<span class="chip on" id="v-unfocus" title="取消聚焦">只看 ${esc(focus)}（${n}）✕</span>`;
+      h += `<br><span class="chip on" id="v-unfocus" title="取消聚焦">只看 ${esc(focus)}（${n}）✕</span>`;
       if (!isBlk({ community: focus })) h += `<span class="chip blk-btn" data-ub="${esc(focus)}" title="整个小区以后都不再显示">⛔ 拉黑这个小区</span>`;
+      // 这个小区里被筛掉的房源：数量 + 原因，点一下临时全部列出
+      const hidden = all.filter((r) => groupKey(r) === focus && r.alive !== false && !rows.includes(r));
+      if (hidden.length) {
+        const why = {};
+        hidden.forEach((r) => { const k = hiddenReason(r) || '其他条件'; why[k] = (why[k] || 0) + 1; });
+        const txt = Object.entries(why).map(([k, v]) => `${k} ${v}`).join('、');
+        h += `<span class="chip${focusAll ? ' on' : ''}" id="v-focusall" title="被筛掉的原因：${esc(txt)}">${focusAll ? '已显示全部' : `另有 ${hidden.length} 套被筛掉（${esc(txt)}）· 显示`}</span>`;
+      }
     }
     const lo = loosened();
     if (lo) h += `<br><span class="warn">${lo}比查询时放宽了，范围外的房源要重新 ① 查询才有</span>`;
@@ -1582,14 +1620,16 @@ ${commuteTip(best)}` : ''}`;
       return sortAsc ? c : -c;
     });
     const cols = visibleCols();
-    const list = focus ? rows.filter((r) => groupKey(r) === focus) : rows;
+    const list = !focus ? rows
+      : focusAll ? all.filter((r) => groupKey(r) === focus && r.alive !== false)    // 聚焦小区时临时显示全部（含被筛掉的）
+      : rows.filter((r) => groupKey(r) === focus);
     $('th').innerHTML = `<tr><th data-k="community">小区 · ${list.length} 套</th>`
       + cols.map((c) => (c.nosort ? `<th>${c.t}</th>` : `<th data-k="${c.k}"${c.num ? ' class="num"' : ''}>${c.t}</th>`)).join('') + '<th></th></tr>';
     $('th').querySelectorAll('th[data-k]').forEach((th) => th.classList.toggle('on', th.dataset.k === sortKey));
     tb.innerHTML = list.slice(0, 500).map((r) => {
       const m = marks[r.url];
       const blk = isBlk(r);
-      const cls = [m === 'hide' && 'hid', blk && 'blk'].filter(Boolean).join(' ');
+      const cls = [(m === 'hide' || (focusAll && !rows.includes(r))) && 'hid', blk && 'blk'].filter(Boolean).join(' ');
       return `
       <tr data-u="${esc(r.url)}" data-g="${esc(groupKey(r))}"${cls ? ` class="${cls}"` : ''}>
         <td><a href="${esc(r.url)}" target="_blank" title="${esc(r.title)}">${esc(r.community)}</a>${r.dupUrls ? ` <span class="dup" title="同一套房还被挂了 ${r.dupUrls.length} 次：\n${esc(r.dupUrls.join('\n'))}">×${r.dupUrls.length + 1}</span>` : ''}${m === 'star' ? ' <span class="star">★</span>' : ''}${blk ? ' <span class="blk-tag">已拉黑</span>' : ''}
@@ -1672,10 +1712,11 @@ ${commuteTip(best)}` : ''}`;
 
     // 结果筛选：分面 / 开关 / 聚焦 / 重置，全部委托
     el.querySelector('#vf').addEventListener('click', (e) => {
-      const t = e.target.closest('[data-f],[data-t],[data-ub],#v-unfocus,#v-reset,#v-blk');
+      const t = e.target.closest('[data-f],[data-t],[data-ub],#v-unfocus,#v-reset,#v-blk,#v-focusall');
       if (!t) return;
       if (t.dataset.ub != null) { toggleBlk(t.dataset.ub); return; }   // 拉黑 / 移出黑名单
       if (t.id === 'v-blk') { showBlkList = !showBlkList; renderNote(); return; }
+      if (t.id === 'v-focusall') { focusAll = !focusAll; renderTable(); renderNote(); return; }
       if (t.dataset.f) {
         const k = t.dataset.f, v = t.dataset.v;
         vf[k] = vf[k].includes(v) ? vf[k].filter((x) => x !== v) : [...vf[k], v];
@@ -1972,12 +2013,13 @@ ${commuteTip(best)}` : ''}`;
     cfg, vf, marks,
     redraw: () => drawOnMap(rows, false),
     clearCache,                              // __kef.clearCache() 清掉 IndexedDB 里的全部缓存
+    focus: (k) => focusGroup(k),             // __kef.focus('小区名') 表格只看这个小区
     cacheStats: () => ({ IndexedDB: !!idb, 小区坐标: geoCache.size, 小区停车: parkCache.size, 房源详情: detailCache.size, 通勤路线: commuteCache.size, 安居客小区: Object.keys(ajkDb).length, 上次结果: lastResult ? lastResult.all.length : 0 }),
     diag() {
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.7.1',
+        脚本版本: '2.7.2',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
