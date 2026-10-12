@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.7.2
+// @version      2.7.3
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -1663,6 +1663,20 @@ ${commuteTip(best)}` : ''}`;
     };
   }
 
+  // 官方条件栏查询后会折叠，标题里直接写出勾了什么——曾经勾着「精装修」忘了，漏掉一批房源
+  function officialSummary() {
+    const groups = {};
+    document.querySelectorAll('#query-opts .chip.on').forEach((c) => {
+      if (c.dataset.v === '') return;                                   // 「不限」不用写
+      (groups[c.dataset.n] = groups[c.dataset.n] || []).push(c.textContent.trim());
+    });
+    return Object.values(groups).map((v) => v.join('/')).join(' · ') || '不限';
+  }
+  function updateOptsSummary() {
+    const s = document.querySelector('#query-opts summary');
+    if (s) s.textContent = `${SITE === 'ajk' ? '安居客' : '贝壳'}官方条件：${officialSummary()}（改了要重新 ① 查询）`;
+  }
+
   function setMapBtn() {
     const b = $('b-map');
     if (!b) return;
@@ -1702,8 +1716,10 @@ ${commuteTip(best)}` : ''}`;
           cfg[n] = [...el.querySelectorAll(`[data-n="${n}"].on`)].map((x) => x.dataset.v);
         }
         GM_setValue('kef-cfg', cfg);
+        updateOptsSummary();
       };
     });
+    updateOptsSummary();
 
     // 数字框即时筛选：查过之后改面积/租金/单价/半径，结果和地图立刻跟着变
     ['f-amin', 'f-amax', 'f-pmin', 'f-pmax', 'f-uprice', 'f-radius', 'f-bike', 'f-walk', 'f-metro', 'f-anchor'].forEach((id) => {
@@ -1853,6 +1869,7 @@ ${commuteTip(best)}` : ''}`;
       if (abort) msg += ' <span class="warn">· 已中止</span>';
       if (res.capped) msg += ' <span class="warn">· 触及 1000 条上限，建议缩半径或提高面积下限</span>';
       msg += ajkMsg;
+      msg += `<br><span class="sub">官方条件：${esc(officialSummary())}</span>`;
       const located = all.filter((r) => r.lng != null).length;
       const parked = all.filter((r) => r.parkLabel).length;
       msg += `<br>缓存命中：坐标 ${located} 套 · 停车 ${parked} 套 · 详情 ${nDetail} 套。`;
@@ -2019,7 +2036,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.7.2',
+        脚本版本: '2.7.3',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
