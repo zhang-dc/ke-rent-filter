@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.8.0
+// @version      2.8.1
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -1315,11 +1315,11 @@ ${commuteTip(best)}` : ''}`;
     st(`停车场图层：可视范围内 ${n} 个停车场（紫色 P = 地下车库，橙点 = 路边 / 临时，灰点 = 地上停车场）。${keys.length > PARK_MAX_TILES ? '范围太大没搜全，放大一点会补上。' : ''}`);
   }
 
-  // 「逸仙华庭-地下停车场」→「逸仙华庭·地下」，「停车场(河曲路)」→「河曲路」
+  // 「逸仙华庭-地下停车场」→「逸仙华庭」，「停车场(河曲路)」→「河曲路」。类型看颜色，名字里不重复
   function parkShortName(title) {
     return String(title || '')
       .replace(/^停车场[(（](.+?)[)）]$/, '$1')
-      .replace(/[-－—]?(地下|地上|门前|露天|立体|机械)?停车(场|库|区|位)?$/, (m, k) => (k ? `·${k}` : ''))
+      .replace(/[-－—·]?(地下|地上|门前|露天|立体|机械|临时|路侧|路边)?(停车(场|库|区|位|点)?)?$/, '')
       .replace(/^[-·]+|[-·]+$/g, '')
       .slice(0, 16) || '停车场';
   }
@@ -2177,7 +2177,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.8.0',
+        脚本版本: '2.8.1',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
