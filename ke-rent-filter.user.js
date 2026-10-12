@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.7.3
+// @version      2.8.0
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -225,18 +225,19 @@
   // 启动时整表读进内存 Map，之后改一条写一条。GM 存储只放配置、收藏这类小东西。
   // 有效期：坐标不过期；停车 60 天；详情 3 天（已下架的记 7 天）。过期的启动时清掉。
   const DAY = 864e5;
-  const TTL = { geo: Infinity, park: 60 * DAY, detail: 3 * DAY, dead: 7 * DAY, commute: 90 * DAY };
-  const STORES = ['geo', 'park', 'detail', 'result', 'commute'];
+  const TTL = { geo: Infinity, park: 60 * DAY, detail: 3 * DAY, dead: 7 * DAY, commute: 90 * DAY, ppoi: 30 * DAY };
+  const STORES = ['geo', 'park', 'detail', 'result', 'commute', 'ppoi'];
   const geoCache = new Map();         // `${cityId}:${小区}` → { lng, lat, t }
   const parkCache = new Map();        // `${cityId}:${小区}` → { own, ownNames, near, count, t }
   const detailCache = new Map();      // 房源编号 → { t, alive, deadReason, ...详情字段 }
+  const ppoiCache = new Map();        // 网格块 `lat,lng`（0.01°）→ { t, list: [{ uid, title, address, lng, lat }] }
   const commuteCache = new Map();     // `v2|${cityId}:${小区}@锚点` → { bike, walk, metro, t }
   let lastResult = null;              // { all, queryCfg, savedAt }
   let idb = null;
 
   const idbReq = (q) => new Promise((res, rej) => { q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
   function idbOpen() {
-    const q = W.indexedDB.open('kef-cache', 3);     // v3 加了 commute
+    const q = W.indexedDB.open('kef-cache', 4);     // v3 加了 commute，v4 加了 ppoi
     q.onupgradeneeded = () => STORES.forEach((s) => { if (!q.result.objectStoreNames.contains(s)) q.result.createObjectStore(s); });
     return idbReq(q);
   }
@@ -261,13 +262,14 @@
   async function initCache() {
     try {
       idb = await idbOpen();
-      const [g, p, d, r, rd] = await Promise.all(STORES.map(idbLoad));
+      const [g, p, d, r, rd, pp] = await Promise.all(STORES.map(idbLoad));
       const stale = { park: [], detail: [] };
       g.forEach((v, k) => geoCache.set(k, v));
       p.forEach((v, k) => (fresh(v, TTL.park) ? parkCache.set(k, v) : stale.park.push(k)));
       d.forEach((v, k) => (fresh(v, detailTTL(v)) ? detailCache.set(k, v) : stale.detail.push(k)));
       lastResult = r.get('last') || null;
       rd.forEach((v, k) => (fresh(v, TTL.commute) ? commuteCache.set(k, v) : null));
+      pp.forEach((v, k) => (fresh(v, TTL.ppoi) ? ppoiCache.set(k, v) : null));
       for (const [s, ks] of Object.entries(stale)) {
         if (ks.length) { const os = idb.transaction(s, 'readwrite').objectStore(s); ks.forEach((k) => os.delete(k)); }
       }
@@ -286,7 +288,7 @@
   const cacheReady = initCache();
 
   async function clearCache() {
-    geoCache.clear(); parkCache.clear(); detailCache.clear(); commuteCache.clear(); lastResult = null;
+    geoCache.clear(); parkCache.clear(); detailCache.clear(); commuteCache.clear(); ppoiCache.clear(); lastResult = null;
     if (idb) STORES.forEach((s) => { try { idb.transaction(s, 'readwrite').objectStore(s).clear(); } catch {} });
   }
 
@@ -1120,14 +1122,14 @@
 
     map.clearOverlays = function () {
       try {
-        const mine = new Set(overlays);
+        const mine = new Set([...overlays, ...parkOverlays]);
         const all = map.getOverlays().slice();          // 先快照，边删边遍历会漏
         all.forEach((o) => { if (!mine.has(o)) rawRemove(o); });
       } catch { rawClear(); overlays = []; }
     };
 
     map.removeOverlay = function (o) {
-      if (overlays.includes(o)) return;                 // 我们的，不许删
+      if (overlays.includes(o) || parkOverlays.includes(o)) return;                 // 我们的，不许删
       return rawRemove(o);
     };
 
@@ -1140,15 +1142,17 @@
     };
 
     const ensure = () => {
-      if (!overlays.length) return;
+      if (!overlays.length && !parkOverlays.length) return;
       try {
         const present = new Set(map.getOverlays());
-        overlays.forEach((o) => { if (!present.has(o)) map.addOverlay(o); });
+        [...overlays, ...parkOverlays].forEach((o) => { if (!present.has(o)) map.addOverlay(o); });
       } catch {}
     };
     map.addEventListener('moveend', ensure);
     map.addEventListener('zoomend', ensure);
     map.addEventListener('zoomend', updateCompact);
+    map.addEventListener('moveend', () => { if (parkLayerOn) loadParkLayerSoon(); });
+    map.addEventListener('zoomend', updateParkNames);
     map.__kefProtected = true;
   }
 
@@ -1242,6 +1246,121 @@ ${commuteTip(best)}` : ''}`;
     $('kef')?.classList.remove('min');
     renderTable(); renderNote();
     $('kef-table')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+
+  // ══════════ 8b. 停车场图层：把可视范围里所有停车场标在地图上 ══════════
+  // 「小区有没有车场」不够，看周边有没有大地下车库、商场车库、路边泊位更直观。
+  // 百度「按范围搜」每次最多约 100 个，所以按 0.01°（约 1km）网格分块搜，每块缓存 30 天。
+  const PARK_TILE = 0.01, PARK_MIN_ZOOM = 14, PARK_MAX_TILES = 16, PARK_MAX_DRAW = 800;
+  let parkLayerOn = !!GM_getValue('kef-parklayer', false);
+  let parkOverlays = [];
+  let parkLoading = false, parkTimer = 0;
+
+  const parkKind = (title) => (/地下/.test(title) ? 'under' : /路边|路侧|道路|临时|咪表|泊位/.test(title) ? 'street' : 'surface');
+  const PARK_KIND_TEXT = { under: '地下车库', surface: '地上停车场', street: '路边 / 临时停车' };
+
+  function searchParkTile(key) {
+    const [la, ln] = key.split(',').map(Number);
+    return new Promise((resolve) => {
+      const NS = W.BMap;
+      if (!NS || !geoMap) return resolve(null);
+      const list = [];
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      try {
+        const ls = new NS.LocalSearch(geoMap, {
+          pageCapacity: 50,
+          onSearchComplete: (rs) => {
+            try {
+              for (let i = 0; i < rs.getCurrentNumPois(); i++) {
+                const q = rs.getPoi(i);
+                if (q && q.point) list.push({ uid: q.uid, title: q.title || '', address: q.address || '', lng: q.point.lng, lat: q.point.lat });
+              }
+              if (rs.getPageIndex() < Math.min(rs.getNumPages() - 1, 1)) ls.gotoPage(rs.getPageIndex() + 1);
+              else finish(list);
+            } catch { finish(list); }
+          },
+        });
+        ls.searchInBounds('停车场', new NS.Bounds(new NS.Point(ln, la), new NS.Point(ln + PARK_TILE, la + PARK_TILE)));
+        setTimeout(() => finish(list), 10000);
+      } catch { finish(null); }
+    });
+  }
+
+  const loadParkLayerSoon = () => { clearTimeout(parkTimer); parkTimer = setTimeout(loadParkLayer, 600); };
+
+  async function loadParkLayer() {
+    if (!parkLayerOn || !mapInstance || parkLoading) return;
+    await cacheReady;
+    if (!geoMap) await geocodeOne('人民广场');
+    protectMap(mapInstance);
+    const zoom = mapInstance.getZoom();
+    if (zoom < PARK_MIN_ZOOM) { drawParkLayer(); return st(`停车场图层：地图放大一点再看（缩放到 ${PARK_MIN_ZOOM} 级以上才搜，现在 ${zoom} 级）。`); }
+    const b = mapInstance.getBounds(), sw = b.getSouthWest(), ne = b.getNorthEast();
+    const keys = [];
+    for (let la = Math.floor(sw.lat / PARK_TILE) * PARK_TILE; la < ne.lat; la += PARK_TILE) {
+      for (let ln = Math.floor(sw.lng / PARK_TILE) * PARK_TILE; ln < ne.lng; ln += PARK_TILE) keys.push(`${la.toFixed(2)},${ln.toFixed(2)}`);
+    }
+    const todo = keys.filter((k) => !ppoiCache.has(k)).slice(0, PARK_MAX_TILES);
+    parkLoading = true;
+    try {
+      for (const [i, k] of todo.entries()) {
+        st(`停车场图层：搜索第 ${i + 1}/${todo.length} 块（百度地图）…`);
+        const list = await searchParkTile(k);
+        if (list) { const e = { t: Date.now(), list }; ppoiCache.set(k, e); idbPut('ppoi', k, e); }
+        await sleep(GEO_DELAY);
+      }
+    } finally { parkLoading = false; }
+    const n = drawParkLayer();
+    st(`停车场图层：可视范围内 ${n} 个停车场（紫色 P = 地下车库，橙点 = 路边 / 临时，灰点 = 地上停车场）。${keys.length > PARK_MAX_TILES ? '范围太大没搜全，放大一点会补上。' : ''}`);
+  }
+
+  // 「逸仙华庭-地下停车场」→「逸仙华庭·地下」，「停车场(河曲路)」→「河曲路」
+  function parkShortName(title) {
+    return String(title || '')
+      .replace(/^停车场[(（](.+?)[)）]$/, '$1')
+      .replace(/[-－—]?(地下|地上|门前|露天|立体|机械)?停车(场|库|区|位)?$/, (m, k) => (k ? `·${k}` : ''))
+      .replace(/^[-·]+|[-·]+$/g, '')
+      .slice(0, 16) || '停车场';
+  }
+
+  // 名字按缩放显示：15–16 级只显示地下车库的名字，17 级以上全部显示，再小就都不显示
+  function updateParkNames() {
+    try {
+      const z = mapInstance.getZoom(), box = mapInstance.getContainer();
+      box.classList.toggle('kef-pn-under', z >= 15 && z < 17);
+      box.classList.toggle('kef-pn-all', z >= 17);
+    } catch {}
+  }
+
+  function drawParkLayer() {
+    updateParkNames();
+    const NS = W.BMap;
+    if (!mapInstance || !NS) return 0;
+    parkOverlays.forEach((o) => { try { mapInstance.__kefRawRemove ? mapInstance.__kefRawRemove(o) : mapInstance.removeOverlay(o); } catch {} });
+    parkOverlays = [];
+    if (!parkLayerOn) return 0;
+    const b = mapInstance.getBounds();
+    const seen = new Set();
+    let n = 0;
+    for (const { list } of ppoiCache.values()) {
+      for (const q of list) {
+        if (seen.has(q.uid) || n >= PARK_MAX_DRAW) continue;
+        const pt = new NS.Point(q.lng, q.lat);
+        if (!b.containsPoint(pt)) continue;
+        seen.add(q.uid);
+        const kind = parkKind(q.title);
+        const lbl = new NS.Label(`<div class="kef-park-wrap kef-pw-${kind}" title="${esc(q.title)}\n${esc(q.address)}\n${PARK_KIND_TEXT[kind]}">`
+          + `<div class="kef-park kef-park-${kind}">P</div><span class="kef-park-name">${esc(parkShortName(q.title))}</span></div>`, { position: pt, offset: new NS.Size(0, 0) });
+        lbl.setStyle({ border: '0', background: 'transparent', padding: '0' });
+        try { lbl.setZIndex(kind === 'under' ? 1 : 0); } catch {}
+        lbl.__kef = true;
+        mapInstance.addOverlay(lbl);
+        parkOverlays.push(lbl);
+        n++;
+      }
+    }
+    return n;
   }
 
   function renderLegend() {
@@ -1345,6 +1464,18 @@ ${commuteTip(best)}` : ''}`;
   .kef-pin span{margin-left:5px;opacity:.85;font-size:11px}
   .kef-pin:hover,.kef-pin.hl{transform:translate(-50%,calc(-100% - 6px)) scale(1.2);outline:2px solid #1f2329;outline-offset:1px}
   .kef-anchor{--c:#1f2329;font-weight:600;cursor:default}
+  .kef-park-wrap{position:relative;transform:translate(-50%,-50%);display:flex;align-items:center;gap:3px;white-space:nowrap;cursor:help}
+  .kef-park{text-align:center;box-shadow:0 0 0 1px #fff;flex:none}
+  .kef-park-wrap:hover .kef-park{opacity:1 !important;transform:scale(1.5)}
+  .kef-park-name{display:none;font:11px/14px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1f2329;
+    background:rgba(255,255,255,.85);border-radius:3px;padding:0 3px;text-shadow:0 0 2px #fff}
+  .kef-pw-under .kef-park-name{color:#4a2aa0;font-weight:600}
+  .kef-pn-under .kef-pw-under .kef-park-name,.kef-pn-all .kef-park-name,.kef-park-wrap:hover .kef-park-name{display:inline}
+  .kef-park-wrap{transform:translate(-8px,-50%)}
+  /* 地下车库最显眼；地上（多是小区里的小车场）和路边只用小圆点，不抢眼 */
+  .kef-park-under{width:16px;height:16px;border-radius:4px;background:#6a3fd6;color:#fff;font:700 11px/16px Arial,sans-serif}
+  .kef-park-street{width:8px;height:8px;border-radius:50%;background:#ff8f1f;font-size:0;opacity:.9}
+  .kef-park-surface{width:7px;height:7px;border-radius:50%;background:#8a9099;font-size:0;opacity:.55}
   .kef-compact .kef-pin:not(.hl):not(.star):not(.kef-anchor){width:12px;height:12px;padding:0;border-radius:50%;
     font-size:0;line-height:0;box-sizing:border-box;border:2px solid #fff;transform:translate(-50%,-50%)}
   .kef-compact .kef-pin:not(.hl):not(.star):not(.kef-anchor) *{display:none}
@@ -1404,6 +1535,7 @@ ${commuteTip(best)}` : ''}`;
         <button class="danger" id="b-stop">停止</button>
       </div>
       <div class="acts">
+        <button class="ghost${parkLayerOn ? ' on' : ''}" id="b-parklayer" title="把地图可视范围内的停车场都标出来（百度地图，按约 1km 网格搜索并缓存）。再点一次关闭">🅿 停车场图层</button>
         <button class="ghost" id="b-park" title="按小区查百度 POI：小区自有停车场（地下/地上）、最近公共停车场距离。数据来自百度地图，有缓存">🅿 查停车</button>
         <button class="ghost" id="b-commute" title="按百度路线规划算每个小区到锚点的自行车 / 步行 / 地铁+自行车时间，有缓存">🚲 通勤</button>
         <button class="ghost" id="b-detail"${SITE === 'ajk' ? ' style="display:none"' : ''} title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
@@ -1988,6 +2120,15 @@ ${commuteTip(best)}` : ''}`;
       });
     }
 
+    el.querySelector('#b-parklayer').onclick = (e) => {
+      parkLayerOn = !parkLayerOn;
+      GM_setValue('kef-parklayer', parkLayerOn);
+      e.currentTarget.classList.toggle('on', parkLayerOn);
+      if (parkLayerOn) loadParkLayer(); else { drawParkLayer(); st('停车场图层已关闭。'); }
+    };
+    // 上次开着的话，等地图就绪后自动画
+    if (parkLayerOn) { const t = setInterval(() => { if (mapInstance) { clearInterval(t); setTimeout(loadParkLayer, 1500); } }, 500); }
+
     el.querySelector('#b-park').onclick = guard('b-park', async () => {
       if (!all.length) return st('<span class="warn">先点「① 查询」，再点「② 定位」。</span>');
       if (!all.some((r) => r.lng != null)) return st('<span class="warn">要先有小区坐标，点「② 定位」。</span>');
@@ -2036,7 +2177,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.7.3',
+        脚本版本: '2.8.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
