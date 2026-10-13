@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.8.1
+// @version      2.9.0
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
 // @match        https://*.anjuke.com/community/*
 // @match        https://*.zu.anjuke.com/ditu*
 // @match        https://*.zu.anjuke.com/map/*
+// @match        https://*.zu.ke.com/zufang/*
+// @match        https://*.zu.anjuke.com/fangyuan/*
 // @grant        unsafeWindow
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -132,6 +134,124 @@
     const start = () => { kick(); new MutationObserver(kick).observe(document.body, { childList: true, subtree: true }); };
     if (document.readyState === 'loading') addEventListener('DOMContentLoaded', start); else start();
   }
+
+  // ══════════════════ 0b. 房源详情页：打标 ══════════════════
+  // 看房源详情时给它打标签（新旧 / 装修 / 布局 / 采光 / 结论 + 自定义标签 + 备注）。
+  // 存在油猴脚本存储（浏览器本地持久化，三个站共用），地图面板按标签显示和筛选。
+  const TAG_GROUPS = [
+    ['age', '新旧', ['很新', '还行', '老旧']],
+    ['decor', '装修', ['好', '一般', '差']],
+    ['layout', '布局', ['好', '一般', '差']],
+    ['light', '采光', ['好', '一般', '差']],
+    ['verdict', '结论', ['想看', '待定', '放弃']],
+  ];
+  const TAG_PRESET_EXTRA = ['安静', '临街吵', '有阳台', '厨卫小', '家具旧', '可议价'];
+  // 每组第一个是好评、最后一个是差评，地图面板里分别标绿 / 标红
+  const tagTone = (gk, v) => { const g = TAG_GROUPS.find((x) => x[0] === gk); if (!g) return ''; const i = g[2].indexOf(v); return i === 0 ? 'good' : i === g[2].length - 1 ? 'bad' : ''; };
+  const tagLabel = (gk, v) => { const g = TAG_GROUPS.find((x) => x[0] === gk); return g && gk !== 'age' && gk !== 'verdict' ? `${g[1]}${v}` : v; };
+
+  // 房源唯一键：贝壳用房源编号，安居客用房源 ID
+  function listingKey(url) {
+    const s = String(url || '');
+    let m = s.match(/zu\.ke\.com\/zufang\/([A-Z]{2}\d{8,})\.html/);
+    if (m) return `ke:${m[1]}`;
+    m = s.match(/zu\.anjuke\.com\/fangyuan\/(\d{6,})/);
+    return m ? `ajk:${m[1]}` : '';
+  }
+
+  function runTagger() {
+    const key = listingKey(location.href);
+    if (!key) return;
+    const load = () => GM_getValue('kef-tags', {});
+    const get = () => load()[key] || { tags: {}, extra: [], note: '' };
+    const save = (rec) => {
+      const db = load();
+      const empty = !Object.keys(rec.tags).length && !rec.extra.length && !rec.note.trim();
+      if (empty) delete db[key];
+      else db[key] = { ...rec, t: Date.now(), url: location.href.split('?')[0], title: pageTitle(), ...pageFacts() };
+      GM_setValue('kef-tags', db);
+    };
+    const pageTitle = () => ((document.querySelector('h1, .content__title, .house-title') || {}).textContent || document.title).trim().replace(/\s+/g, ' ').slice(0, 60);
+    const pageFacts = () => {
+      const t = document.body.innerText;
+      return { price: +((t.match(/(\d{3,6})\s*元\s*\/\s*月/) || [])[1]) || null, area: +((t.match(/(\d{2,3}(?:\.\d+)?)\s*(?:㎡|平米|m²)/) || [])[1]) || null };
+    };
+    const esc2 = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+
+    const css = `#kef-tag{position:fixed;right:16px;top:110px;z-index:2147483647;width:270px;background:#fff;border:1px solid #d8dde3;border-radius:10px;
+        box-shadow:0 10px 30px rgba(0,0,0,.16);font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1f2329}
+      #kef-tag.min .kt-body{display:none}
+      #kef-tag header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #eef1f4;font-weight:600;cursor:pointer;user-select:none}
+      #kef-tag header small{font-weight:400;color:#00ae66}
+      #kef-tag .kt-body{padding:8px 12px 12px}
+      #kef-tag .kt-row{display:flex;align-items:center;gap:5px;margin:5px 0;flex-wrap:wrap}
+      #kef-tag .kt-k{width:30px;color:#8a9099;font-size:12px;flex:none}
+      #kef-tag .kt-c{padding:1px 9px;border:1px solid #d8dde3;border-radius:11px;cursor:pointer;font-size:12px;color:#646a73;user-select:none}
+      #kef-tag .kt-c.on{color:#fff;border-color:#00ae66;background:#00ae66}
+      #kef-tag .kt-c.on.bad{border-color:#f54a45;background:#f54a45}
+      #kef-tag .kt-c.on.mid{border-color:#ff8f1f;background:#ff8f1f}
+      #kef-tag input,#kef-tag textarea{width:100%;box-sizing:border-box;border:1px solid #d8dde3;border-radius:5px;padding:4px 6px;font-size:12px;font-family:inherit}
+      #kef-tag textarea{height:56px;resize:vertical;margin-top:6px}
+      #kef-tag .kt-add{width:90px}`;
+
+    function render(el) {
+      const rec = get();
+      const defs = [...new Set([...TAG_PRESET_EXTRA, ...GM_getValue('kef-tagdefs', [])])];
+      const n = Object.keys(rec.tags).length + rec.extra.length;
+      el.innerHTML = `<header><span>🏷 给这套房打标 ${n ? `<small>已打 ${n} 个</small>` : ''}</span><span>—</span></header>
+        <div class="kt-body">
+          ${TAG_GROUPS.map(([gk, name, vals]) => `<div class="kt-row"><span class="kt-k">${name}</span>${vals.map((v, i) => {
+            const tone = i === 0 ? '' : i === vals.length - 1 ? ' bad' : ' mid';
+            return `<span class="kt-c${rec.tags[gk] === v ? ' on' + tone : ''}" data-g="${gk}" data-v="${esc2(v)}">${esc2(v)}</span>`;
+          }).join('')}</div>`).join('')}
+          <div class="kt-row"><span class="kt-k">其他</span>${defs.map((v) => `<span class="kt-c${rec.extra.includes(v) ? ' on' : ''}" data-x="${esc2(v)}">${esc2(v)}</span>`).join('')}
+            <input class="kt-add" placeholder="+ 新标签回车"></div>
+          <textarea placeholder="备注：比如看房时间、房东说法、缺点…">${esc2(rec.note)}</textarea>
+        </div>`;
+    }
+
+    function mount() {
+      if (document.getElementById('kef-tag')) return;
+      const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
+      const el = document.createElement('div'); el.id = 'kef-tag';
+      if (GM_getValue('kef-tag-min', false)) el.classList.add('min');
+      document.body.appendChild(el);
+      render(el);
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('header')) { el.classList.toggle('min'); GM_setValue('kef-tag-min', el.classList.contains('min')); return; }
+        const c = e.target.closest('.kt-c');
+        if (!c) return;
+        const rec = get();
+        if (c.dataset.g) {
+          if (rec.tags[c.dataset.g] === c.dataset.v) delete rec.tags[c.dataset.g]; else rec.tags[c.dataset.g] = c.dataset.v;
+        } else {
+          const v = c.dataset.x;
+          rec.extra = rec.extra.includes(v) ? rec.extra.filter((x) => x !== v) : [...rec.extra, v];
+        }
+        save(rec); render(el);
+      });
+      el.addEventListener('keydown', (e) => {
+        if (!e.target.classList.contains('kt-add') || e.key !== 'Enter') return;
+        const v = e.target.value.trim().slice(0, 12);
+        if (!v) return;
+        GM_setValue('kef-tagdefs', [...new Set([...GM_getValue('kef-tagdefs', []), v])]);
+        const rec = get();
+        if (!rec.extra.includes(v)) rec.extra.push(v);
+        save(rec); render(el);
+        el.querySelector('.kt-add').focus();
+      });
+      let t = 0;
+      el.addEventListener('input', (e) => {
+        if (e.target.tagName !== 'TEXTAREA') return;
+        clearTimeout(t);
+        t = setTimeout(() => { const rec = get(); rec.note = e.target.value; save(rec); }, 400);
+      });
+    }
+    if (document.readyState === 'loading') addEventListener('DOMContentLoaded', mount); else mount();
+  }
+
+  const IS_DETAIL = listingKey(location.href) !== '';
+  if (IS_DETAIL) { runTagger(); return; }
 
   // 安居客租房地图页跑完整面板（数据源换成安居客）；其他安居客页面（小区列表 / 详情）只记录小区信息
   const IS_AJK_MAP = /(^|\.)zu\.anjuke\.com$/.test(location.hostname) && /^\/(ditu|map)(\/|$)/.test(location.pathname);
@@ -941,7 +1061,7 @@
   // all 是查询全集，rows 是视图。每次都从 all 重算，条件随便收紧再放宽，不发请求。
   // 只有放宽到查询范围之外（面积下限、租金、半径、锚点）才需要重新查询，面板会提示。
   const marks = GM_getValue('kef-marks', {});            // url → 'star' | 'hide'，跨会话保留
-  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [], kw: '', exkw: '',
+  const VF_DEFAULT = { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [], mytags: [], kw: '', exkw: '',
     onlyStar: false, showHidden: false, onlyLocated: false, noComm: false };
   const vf = Object.assign({}, VF_DEFAULT, GM_getValue('kef-vf', {}));
   let focus = null;                                      // 地图上点中的小区，表格只看它
@@ -961,6 +1081,7 @@
     ['ages', '房龄', ageOf],
     ['listed', '上架', listedOf],
     ['facings', '朝向', (r) => String(r.facing || '').replace(/朝|\s/g, '') || '未知'],
+    ['mytags', '我的标签', (r) => (r.myTags && r.myTags.length ? r.myTags.map((t) => t.label) : ['未打标'])],
   ];
   const TOGGLES = [['onlyStar', '只看★'], ['onlyLocated', '只看已定位'], ['noComm', '排除商水商电'], ['showHidden', '显示已隐藏/拉黑']];
 
@@ -980,7 +1101,7 @@
     if (!passes(r, cfg)) return false;
     if (vf.onlyLocated && r.lng == null) return false;
     if (vf.noComm && r.water === '商水') return false;
-    for (const [k, , fn] of FACETS) if (k !== skip && vf[k].length && !vf[k].includes(fn(r))) return false;
+    for (const [k, , fn] of FACETS) if (k !== skip && vf[k].length && ![].concat(fn(r)).some((v) => vf[k].includes(v))) return false;
     const hay = `${r.title} ${r.community} ${r.tags} ${r.layout} ${r.facing} ${r.brand} ${r.cardType}`;
     const words = (s) => s.split(/\s+/).filter(Boolean);
     if (words(vf.kw).some((w) => !hay.includes(w))) return false;
@@ -1000,7 +1121,7 @@
     if (cfg.maxUnitPrice > 0 && r.unitPrice > cfg.maxUnitPrice) return '单价';
     if (r.distKm != null && cfg.radiusKm > 0 && r.distKm > cfg.radiusKm) return '半径';
     if (!commuteOK(r, cfg)) return '通勤';
-    for (const [k, name, fn] of FACETS) if (vf[k].length && !vf[k].includes(fn(r))) return name;
+    for (const [k, name, fn] of FACETS) if (vf[k].length && ![].concat(fn(r)).some((v) => vf[k].includes(v))) return name;
     if (!viewPass(r)) return '其他条件';
     return '';
   }
@@ -1035,7 +1156,26 @@
   }
 
   let refreshT = 0;
+  // 详情页打的标签（油猴存储，三个站共用）
+  let tagsDb = GM_getValue('kef-tags', {});
+  function applyTags(list) {
+    for (const r of list) {
+      const rec = tagsDb[listingKey(r.url)];
+      if (!rec) { r.myTags = null; r.myNote = ''; continue; }
+      r.myTags = [
+        ...TAG_GROUPS.filter(([gk]) => rec.tags && rec.tags[gk]).map(([gk]) => ({ label: tagLabel(gk, rec.tags[gk]), tone: tagTone(gk, rec.tags[gk]) })),
+        ...(rec.extra || []).map((v) => ({ label: v, tone: '' })),
+      ];
+      r.myNote = rec.note || '';
+    }
+  }
+  function tagsHTML(r) {
+    if (!r.myTags || !r.myTags.length) return r.myNote ? `<span class="mytag" title="${esc(r.myNote)}">📝</span>` : '';
+    return r.myTags.map((t) => `<span class="mytag ${t.tone}"${r.myNote ? ` title="${esc(r.myNote)}"` : ''}>${esc(t.label)}</span>`).join('');
+  }
+
   function refresh({ fit = false } = {}) {
+    applyTags(all);
     clearTimeout(refreshT);
     rows = all.filter((r) => viewPass(r));
     if (focus && !rows.some((r) => groupKey(r) === focus)) focus = null;
@@ -1442,6 +1582,9 @@ ${commuteTip(best)}` : ''}`;
   #kef a.ajk{color:#3c9ce8;text-decoration:none;font-size:11px;white-space:nowrap}
   #kef a.ajk:hover{text-decoration:underline}
   #kef .new{color:#00ae66;font-weight:600}
+  #kef .mytag{display:inline-block;font-size:10px;line-height:15px;padding:0 4px;margin-right:2px;border-radius:3px;background:#eef1f4;color:#646a73}
+  #kef .mytag.good{background:#e8f8f0;color:#00ae66}
+  #kef .mytag.bad{background:#fdeceb;color:#f54a45}
   #kef .dup{font-size:10px;color:#8a9099;border:1px solid #d8dde3;border-radius:3px;padding:0 3px;cursor:help}
   #kef .presets{display:flex;gap:6px;align-items:center;margin:2px 0 6px}
   #kef .presets .k{color:#8a9099;font-size:12px;width:52px}
@@ -1541,6 +1684,11 @@ ${commuteTip(best)}` : ''}`;
         <button class="ghost" id="b-detail"${SITE === 'ajk' ? ' style="display:none"' : ''} title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
         <button class="ghost" id="b-csv">导出 CSV</button>
       </div>
+      <div class="acts">
+        <button class="ghost" id="b-tagexp" title="把打的标签、备注、收藏、黑名单导出成 JSON 文件备份">备份标签</button>
+        <button class="ghost" id="b-tagimp" title="从备份文件恢复（和现有的合并）">恢复备份</button>
+        <input type="file" id="f-tagimp" accept=".json,application/json" style="display:none">
+      </div>
       <div class="status" id="st">面积和半径是贝壳没有的维度。按 ①②③ 顺序点。</div>
       <div class="legend" id="legend"></div>
 
@@ -1587,7 +1735,7 @@ ${commuteTip(best)}` : ''}`;
     if (!box) return;
     const rowsHTML = FACETS.map(([k, name, fn]) => {
       const cnt = new Map();
-      for (const r of all) if (viewPass(r, k)) { const v = fn(r); cnt.set(v, (cnt.get(v) || 0) + 1); }
+      for (const r of all) if (viewPass(r, k)) for (const v of [].concat(fn(r))) cnt.set(v, (cnt.get(v) || 0) + 1);
       for (const v of vf[k]) if (!cnt.has(v)) cnt.set(v, 0);
       if (cnt.size <= 1 && !vf[k].length) return '';           // 只有一种取值，没得筛
       const ORDER = { ages: ['2015年后', '2010–2014', '2000–2009', '2000年前', '房龄未知'], listed: ['7天内', '30天内', '90天内', '更早', '上架未知'],
@@ -1670,7 +1818,8 @@ ${commuteTip(best)}` : ''}`;
     { k: 'gas', t: '燃气', wide: true },
     { k: 'checkin', t: '入住', wide: true },
     { k: 'lease', t: '租期', wide: true },
-    { k: 'tags', t: '标签', wide: true, cls: 'tags' },
+    { k: 'tags', t: '房源标签', wide: true, cls: 'tags' },
+    { k: 'myNote', t: '我的标签', wide: true, cls: 'tags', v: (r) => tagsHTML(r) + (r.myNote ? `<div class="sub">${esc(r.myNote.slice(0, 40))}</div>` : '') },
   ];
   let wide = !!GM_getValue('kef-wide', false);
   const visibleCols = () => COLS.filter((c) => wide || !c.wide);
@@ -1737,6 +1886,7 @@ ${commuteTip(best)}` : ''}`;
       if (r.parkLevel) bits.push(`🅿${parkHTML(r)} ${ajkLink(r)}`);
       if (r.carSpot) bits.push(`车位${esc(r.carSpot)}`);
       if (r.water === '商水') bits.push('<span class="hot">商水商电</span>');
+      if (r.myTags || r.myNote) bits.push(tagsHTML(r));
     }
     return bits.join(' · ');
   }
@@ -1873,7 +2023,7 @@ ${commuteTip(best)}` : ''}`;
       } else if (t.id === 'v-unfocus') {
         focusGroup(focus); return;
       } else if (t.id === 'v-reset') {
-        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [] });
+        Object.assign(vf, VF_DEFAULT, { rooms: [], types: [], brands: [], parks: [], ages: [], listed: [], facings: [], mytags: [] });
         el.querySelector('#v-kw').value = ''; el.querySelector('#v-ex').value = '';
         focus = null;
       }
@@ -2110,6 +2260,11 @@ ${commuteTip(best)}` : ''}`;
 
     // 在安居客浏览小区页时记下的新信息，实时同步过来
     if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener('kef-tags', (_k, _old, v, remote) => {
+        if (!remote) return;
+        tagsDb = v || {};
+        refresh();
+      });
       GM_addValueChangeListener('kef-ajk', (_k, _old, v, remote) => {
         if (!remote) return;
         ajkDb = v || {};
@@ -2144,6 +2299,34 @@ ${commuteTip(best)}` : ''}`;
 
     el.querySelector('#b-csv').onclick = () => rows.length && exportCSV();
 
+    // 标签都存在浏览器本地；这里能导出成文件备份，换电脑 / 重装浏览器时导回来
+    el.querySelector('#b-tagexp').onclick = () => {
+      const data = { app: 'ke-rent-filter', v: 1, at: new Date().toISOString(),
+        tags: GM_getValue('kef-tags', {}), tagdefs: GM_getValue('kef-tagdefs', []), marks: GM_getValue('kef-marks', {}), blk: GM_getValue('kef-blk', []) };
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
+      a.download = `租房标签备份-${ymd(Date.now())}.json`;
+      a.click();
+      st(`已导出：${Object.keys(data.tags).length} 套房的标签、${Object.keys(data.marks).length} 个收藏 / 隐藏、${data.blk.length} 个拉黑小区。`);
+    };
+    el.querySelector('#b-tagimp').onclick = () => el.querySelector('#f-tagimp').click();
+    el.querySelector('#f-tagimp').onchange = async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      try {
+        const d = JSON.parse(await f.text());
+        if (d.app !== 'ke-rent-filter') throw new Error('不是这个工具导出的备份');
+        GM_setValue('kef-tags', { ...GM_getValue('kef-tags', {}), ...(d.tags || {}) });
+        GM_setValue('kef-tagdefs', [...new Set([...GM_getValue('kef-tagdefs', []), ...(d.tagdefs || [])])]);
+        Object.assign(marks, d.marks || {}); GM_setValue('kef-marks', marks);
+        (d.blk || []).forEach((k) => blacklist.add(k)); GM_setValue('kef-blk', [...blacklist]);
+        tagsDb = GM_getValue('kef-tags', {});
+        refresh();
+        st(`已恢复：${Object.keys(d.tags || {}).length} 套房的标签（和现有的合并）。`);
+      } catch (err) { st(`<span class="err">恢复失败：${esc(err.message)}</span>`); }
+      e.target.value = '';
+    };
+
     renderFacets(); renderNote();
     // IndexedDB 是异步的，读完再恢复上次结果
     cacheReady.then(() => {
@@ -2177,7 +2360,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.8.1',
+        脚本版本: '2.9.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
