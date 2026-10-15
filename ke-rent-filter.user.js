@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.9.0
+// @version      2.10.0
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -1276,9 +1276,12 @@
     // 地图同步开启时，页面自己的房源气泡不再加到地图上，地图上只剩筛选后的标记。
     // 关掉同步后恢复原样，页面下次刷新气泡就回来了
     const rawAdd = map.addOverlay.bind(map);
+    // 同步时页面自己的气泡照样加上，但立刻隐藏：点我们的气泡时要替它点一下，触发平台自己的选中
+    //（平台的点击监听绑在它的覆盖物对象上，不加到地图上就点不到）
     map.addOverlay = function (o) {
-      if (mapSync && o && !o.__kef) return;
-      return rawAdd(o);
+      const ret = rawAdd(o);
+      if (mapSync && o && !o.__kef) hideNative(o);
+      return ret;
     };
 
     const ensure = () => {
@@ -1378,11 +1381,80 @@ ${commuteTip(best)}` : ''}`;
   }
 
   // 点地图气泡：表格只看这个小区（再点一次取消）
+  function hideNative(o) {
+    try { o.hide(); o.__kefHidden = true; } catch {}
+  }
+
+  // ── 联动平台自己的选中：点我们的气泡 = 替平台点一下同一个小区的原生气泡
+  // 平台的原生气泡带小区名（贝壳：<div class="community" data-id=…>墨翠里 | 24套</div>）。
+  // 同步开着时它们是隐藏的，照样能点。缩放太小时平台还没出小区级气泡，先放大到这个小区再点。
+  // 贝壳：<div class="community" data-id=…>名字 | N套</div>；安居客：<div class="ol-commu" data-id=小区ID><span class="ol-commu-name">名字</span>…
+  const NATIVE_MIN_ZOOM = 17;
+  function findNative(name, id) {
+    const els = [...document.querySelectorAll(SITE === 'ajk' ? '.ol-commu' : '.community')];
+    if (id) { const byId = els.find((d) => d.dataset.id === String(id)); if (byId) return byId; }
+    const nameOf = (d) => ((SITE === 'ajk' ? d.querySelector('.ol-commu-name')?.textContent : d.textContent.split(/[|｜]/)[0]) || '').replace(/\s+/g, '').trim();
+    // 先找名字完全一样的，再放宽到去掉括号后一样（免得「逸仙二村(北区)」选成「逸仙二村(东区)」）
+    const exact = name.replace(/\s+/g, '');
+    return els.find((d) => nameOf(d) === exact) || els.find((d) => normName(nameOf(d)) === normName(name)) || null;
+  }
+  // 平台自己记录的小区 ID 和坐标（我们气泡的坐标来自百度地名搜索，可能差几百米；
+  // 平台在一个视野里只加载有限个小区，按我们的坐标放大不一定能加载到它）
+  async function platformLocate(name, id, pt) {
+    if (!pt) return null;
+    const d = 0.01;
+    const box = { minLatitude: pt.lat - d, maxLatitude: pt.lat + d, minLongitude: pt.lng - d, maxLongitude: pt.lng + d };
+    // 名字完全一样优先，其次去掉括号后一样，最后才是互相包含
+    const pick = (list, nameOf) => {
+      const exact = name.replace(/\s+/g, '');
+      const a = (n) => normName(n), b = normName(name);
+      return list.find((x) => nameOf(x).replace(/\s+/g, '') === exact)
+        || list.find((x) => a(nameOf(x)) === b)
+        || list.find((x) => { const s = a(nameOf(x)); return Math.min(s.length, b.length) >= 3 && (s.includes(b) || b.includes(s)); });
+    };
+    try {
+      if (SITE === 'ajk') {
+        const q = qs({ p: 1, maxp: 99, room_num: 0, price_id: 0, rent_type: 0, price_min: 0, price_max: 0, lx_id: '', tag_id: '', orient_id: '', order_id: 0,
+          lat: `${box.minLatitude.toFixed(6)}_${box.maxLatitude.toFixed(6)}`, lng: `${box.minLongitude.toFixed(6)}_${box.maxLongitude.toFixed(6)}`, zoom: 17 });
+        const j = await (await rawFetch(`/map/ajax/pclist/Api_get_facet?${q}`, { credentials: 'include' })).json();
+        const list = (j.val && j.val.community_list) || [];
+        const c = (id && list.find((x) => String(x.id) === String(id))) || pick(list, (x) => x.name || '');
+        return c ? { id: String(c.id), lng: +c.lng, lat: +c.lat } : null;
+      }
+      const j = await (await rawFetch(`https://map.ke.com/proxyApi/i.c-pc-webapi.ke.com/map/bubblelist?${qs({ cityId: cfg.cityId, dataSource: 'ZF', condition: '', id: '', groupType: 'community', ...box })}`, { credentials: 'include' })).json();
+      const c = pick(((j.data && j.data.bubbleList) || []).filter((x) => x.entityType === 'resblock'), (x) => x.name || '');
+      return c ? { id: String(c.id), lng: +c.longitude, lat: +c.latitude } : null;
+    } catch { return null; }
+  }
+
+  async function selectNative(name, pt, id) {
+    if (!mapInstance) return false;
+    let el = findNative(name, id);
+    if (!el && pt) {
+      const loc = await platformLocate(name, id, pt);
+      if (loc) id = loc.id;
+      el = findNative(name, id);
+      if (!el) {
+        const P = new W.BMap.Point(loc ? loc.lng : pt.lng, loc ? loc.lat : pt.lat);
+        mapInstance.centerAndZoom(P, Math.max(mapInstance.getZoom(), NATIVE_MIN_ZOOM));
+        for (let i = 0; i < 40 && !el; i++) { await sleep(250); el = findNative(name, id); }
+      }
+    }
+    if (!el) return false;
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: W }));
+    return true;
+  }
+
   function focusGroup(k) {
     if (focus) hlPin(focus, false);
     focus = focus === k ? null : k;
     focusAll = false;
     if (focus) hlPin(focus, true);
+    if (focus) {
+      const p = pins.get(focus);
+      const any = all.find((r) => groupKey(r) === focus);
+      selectNative(focus, p && p.pt, any && any.ajkCommunityId).then((ok) => { if (!ok) st(`平台上没找到「${esc(focus)}」的小区气泡，左侧列表没有联动。`); });
+    }
     $('kef')?.classList.remove('min');
     renderTable(); renderNote();
     $('kef-table')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
@@ -2177,6 +2249,7 @@ ${commuteTip(best)}` : ''}`;
       if (mapSync) {
         mapSync = false;
         clearOverlays(); setMapBtn(); renderLegend();
+        try { mapInstance.getOverlays().forEach((o) => { if (o.__kefHidden) { o.show(); o.__kefHidden = false; } }); } catch {}
         try { mapInstance.panBy(1, 0); } catch {}       // 触发一次 moveend，让原生气泡回来
         return st(`已还原${SITE === 'ajk' ? '安居客' : '贝壳'}原生地图。`);
       }
@@ -2186,7 +2259,7 @@ ${commuteTip(best)}` : ''}`;
       if (!rows.some((r) => r.lng != null)) return st('<span class="warn">还没有坐标，先点「② 定位」。</span>');
       mapSync = true; setMapBtn();
       const { n, g } = drawOnMap(rows, true);
-      try { mapInstance.clearOverlays(); } catch {}      // 清掉页面已画的气泡（我们的标记会保留）
+      try { mapInstance.getOverlays().forEach((o) => { if (!o.__kef) hideNative(o); }); } catch {}   // 页面已画的气泡先藏起来
       st(`地图上 <b>${g}</b> 个小区 / ${n} 套（同小区合并成一个气泡，原生气泡已隐藏）。<br>`
         + '点气泡 = 表格只看该小区；悬停表格行 = 高亮气泡；之后改筛选地图自动同步。');
     };
@@ -2360,7 +2433,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.9.0',
+        脚本版本: '2.10.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
