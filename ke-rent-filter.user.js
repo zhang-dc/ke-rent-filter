@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         租房筛选助手（贝壳 / 安居客：面积 / 通勤 / 房龄 / 停车）
 // @namespace    https://github.com/zhang-dc/ke-rent-filter
-// @version      2.10.0
+// @version      2.11.0
 // @description  帮租客和租赁中介整理、比较贝壳、安居客地图找房上的房源：按面积、通勤时间（自行车 / 步行 / 地铁）、房龄、每平米租金、停车条件筛选，标在地图上，可收藏、拉黑和导出。
 // @author       zhang-dc
 // @match        https://map.ke.com/map/*
@@ -1400,18 +1400,90 @@ ${commuteTip(best)}` : ''}`;
   }
   // 平台自己记录的小区 ID 和坐标（我们气泡的坐标来自百度地名搜索，可能差几百米；
   // 平台在一个视野里只加载有限个小区，按我们的坐标放大不一定能加载到它）
+  // 名字完全一样优先，其次去掉括号后一样，最后才是互相包含
+  function pickByName(list, name, nameOf) {
+    const exact = String(name).replace(/\s+/g, '');
+    const a = (n) => normName(n), b = normName(name);
+    return list.find((x) => nameOf(x).replace(/\s+/g, '') === exact)
+      || list.find((x) => a(nameOf(x)) === b)
+      || list.find((x) => { const t = a(nameOf(x)); return Math.min(t.length, b.length) >= 3 && (t.includes(b) || b.includes(t)); });
+  }
+
+  // ── 补房龄：用平台自己的数据批量拿建成年代
+  // 安居客：地图小区列表接口（zoom=17 时返回 community_list，带 build_date / 地址），按约 2km 网格每块一次
+  // 贝壳：小区气泡接口（groupType=community）拿小区 ID，再逐个取小区卡片「板楼 | 共23栋 352户 | 1987年建成」
+  // 记进安居客小区记录（kef-ajk，油猴存储两站共用），竣工列 / 房龄筛选直接生效；户数也记下，以后算车位比用
+  const YEAR_TILE = 0.02;
+  function saveXq(c, name, info) {
+    const key = `${c.cityId}:${normName(name)}`;
+    const old = ajkDb[key] || {};
+    ajkDb[key] = { ...old, name: old.name || name, year: old.year || info.year || null, addr: old.addr || info.addr || '',
+      extra: { ...(info.extra || {}), ...(old.extra || {}) }, src: old.src || info.src, t: Date.now() };
+  }
+
+  async function fillYears(list, c, onProgress) {
+    const need = new Map();
+    for (const r of list) if (r.lng != null && r.community && !r.year && !need.has(r.community)) need.set(r.community, r);
+    const tiles = new Map();
+    for (const r of need.values()) {
+      const k = `${(Math.floor(r.lat / YEAR_TILE) * YEAR_TILE).toFixed(2)},${(Math.floor(r.lng / YEAR_TILE) * YEAR_TILE).toFixed(2)}`;
+      if (!tiles.has(k)) tiles.set(k, []);
+      tiles.get(k).push(r);
+    }
+    let got = 0, done = 0, error = '';
+    const pad = 0.003;   // 网格外扩一点，压边的小区也能对上
+    try {
+      for (const [k, rs] of tiles) {
+        if (abort) break;
+        const [la, ln] = k.split(',').map(Number);
+        const box = { minLatitude: la - pad, maxLatitude: la + YEAR_TILE + pad, minLongitude: ln - pad, maxLongitude: ln + YEAR_TILE + pad };
+        if (SITE === 'ajk') {
+          const q = qs({ p: 1, maxp: 99, room_num: 0, price_id: 0, rent_type: 0, price_min: 0, price_max: 0, lx_id: '', tag_id: '', orient_id: '', order_id: 0,
+            lat: `${box.minLatitude.toFixed(6)}_${box.maxLatitude.toFixed(6)}`, lng: `${box.minLongitude.toFixed(6)}_${box.maxLongitude.toFixed(6)}`, zoom: 17 });
+          const j = await ajkGetJSON(`https://${AJK_ZU[c.cityId] || 'sh'}.zu.anjuke.com/map/ajax/pclist/Api_get_facet?${q}`);
+          const listC = (j.val && j.val.community_list) || [];
+          // 整块记下（不只是要补的），以后查到这片的其他小区也有年代
+          for (const x of listC) {
+            const y = +(String(x.build_date || '').match(/(\d{4})/) || [])[1] || null;
+            if (y || x.address) saveXq(c, x.name, { year: y, addr: x.address, src: 'ajk-map' });
+          }
+          for (const r of rs) { const x = pickByName(listC, r.community, (v) => v.name || ''); if (x && /\d{4}/.test(x.build_date || '')) got++; }
+          await sleep(AJK_DELAY);
+        } else {
+          const j = await (await rawFetch(`https://map.ke.com/proxyApi/i.c-pc-webapi.ke.com/map/bubblelist?${qs({ cityId: c.cityId, dataSource: 'ZF', condition: '', id: '', groupType: 'community', ...box })}`, { credentials: 'include' })).json();
+          const bl = ((j.data && j.data.bubbleList) || []).filter((x) => x.entityType === 'resblock');
+          await sleep(REQ_DELAY);
+          for (const r of rs) {
+            if (abort) break;
+            const b = pickByName(bl, r.community, (v) => v.name || '');
+            if (!b) continue;
+            const h = await (await rawFetch(`${API}?${qs({ cityId: c.cityId, dataSource: 'ZF', curPage: 1, condition: '', type: b.imageType || 30002, resblockId: b.id, ...box })}`, { credentials: 'include' })).json();
+            const card = h.data && h.data.resblockCard;
+            const desc = (card && card.communityDesc) || '';
+            const y = +(desc.match(/(\d{4})年建成/) || [])[1] || null;
+            const extra = {};
+            const hh = (desc.match(/(\d+)户/) || [])[1]; if (hh) extra['总户数'] = `${hh}户`;
+            const bd = (desc.match(/共(\d+)栋/) || [])[1]; if (bd) extra['楼栋数'] = `${bd}栋`;
+            const tp = desc.split('|')[0].trim(); if (tp && !/\d/.test(tp)) extra['建筑类型'] = tp;
+            saveXq(c, r.community, { year: y, extra, src: 'ke-card' });
+            if (y) got++;
+            await sleep(REQ_DELAY);
+          }
+        }
+        onProgress?.({ done: ++done, total: tiles.size, got, need: need.size });
+        if (done % 5 === 0) GM_setValue('kef-ajk', ajkDb);
+      }
+    } catch (e) { error = e.message; }
+    GM_setValue('kef-ajk', ajkDb);
+    applyAjk(all, c);
+    return { need: need.size, got, error };
+  }
+
   async function platformLocate(name, id, pt) {
     if (!pt) return null;
     const d = 0.01;
     const box = { minLatitude: pt.lat - d, maxLatitude: pt.lat + d, minLongitude: pt.lng - d, maxLongitude: pt.lng + d };
-    // 名字完全一样优先，其次去掉括号后一样，最后才是互相包含
-    const pick = (list, nameOf) => {
-      const exact = name.replace(/\s+/g, '');
-      const a = (n) => normName(n), b = normName(name);
-      return list.find((x) => nameOf(x).replace(/\s+/g, '') === exact)
-        || list.find((x) => a(nameOf(x)) === b)
-        || list.find((x) => { const s = a(nameOf(x)); return Math.min(s.length, b.length) >= 3 && (s.includes(b) || b.includes(s)); });
-    };
+    const pick = (list, nameOf) => pickByName(list, name, nameOf);
     try {
       if (SITE === 'ajk') {
         const q = qs({ p: 1, maxp: 99, room_num: 0, price_id: 0, rent_type: 0, price_min: 0, price_max: 0, lx_id: '', tag_id: '', orient_id: '', order_id: 0,
@@ -1751,6 +1823,7 @@ ${commuteTip(best)}` : ''}`;
       </div>
       <div class="acts">
         <button class="ghost${parkLayerOn ? ' on' : ''}" id="b-parklayer" title="把地图可视范围内的停车场都标出来（百度地图，按约 1km 网格搜索并缓存）。再点一次关闭">🅿 停车场图层</button>
+        <button class="ghost" id="b-years" title="用平台自己的数据批量补建成年代（安居客：地图小区列表；贝壳：小区卡片），只补当前结果里还没有年代的小区">🏠 补房龄</button>
         <button class="ghost" id="b-park" title="按小区查百度 POI：小区自有停车场（地下/地上）、最近公共停车场距离。数据来自百度地图，有缓存">🅿 查停车</button>
         <button class="ghost" id="b-commute" title="按百度路线规划算每个小区到锚点的自行车 / 步行 / 地铁+自行车时间，有缓存">🚲 通勤</button>
         <button class="ghost" id="b-detail"${SITE === 'ajk' ? ' style="display:none"' : ''} title="逐套开详情页：剔除已下架，补楼层 / 电梯 / 车位 / 水电 / 燃气 / 入住 / 租期 + 精确坐标。慢，0.7s/套">④ 详情补全</button>
@@ -2357,6 +2430,16 @@ ${commuteTip(best)}` : ''}`;
     // 上次开着的话，等地图就绪后自动画
     if (parkLayerOn) { const t = setInterval(() => { if (mapInstance) { clearInterval(t); setTimeout(loadParkLayer, 1500); } }, 500); }
 
+    el.querySelector('#b-years').onclick = guard('b-years', async () => {
+      if (!rows.length) return st('<span class="warn">先「① 查询」「② 定位」，有了结果再补。</span>');
+      const c = readUI();
+      const r = await fillYears(rows, c, (p) => st(`补房龄：第 ${p.done}/${p.total} 片 · 已补上 ${p.got}/${p.need} 个小区（${SITE === 'ajk' ? '安居客地图数据' : '贝壳小区信息'}）`));
+      refresh();
+      const known = new Set(rows.filter((x) => x.year).map((x) => x.community)).size, total = new Set(rows.map((x) => x.community)).size;
+      st(`补房龄完成：这次补上 ${r.got} 个小区，当前结果里 ${known}/${total} 个小区有建成年代。`
+        + (r.error ? ` <span class="warn">${esc(r.error)}，已停在这里。</span>` : '') + '<br>在「结果筛选 → 房龄」里筛次新。');
+    });
+
     el.querySelector('#b-park').onclick = guard('b-park', async () => {
       if (!all.length) return st('<span class="warn">先点「① 查询」，再点「② 定位」。</span>');
       if (!all.some((r) => r.lng != null)) return st('<span class="warn">要先有小区坐标，点「② 定位」。</span>');
@@ -2433,7 +2516,7 @@ ${commuteTip(best)}` : ''}`;
       const NS = W.BMap;
       const withXY = rows.filter((r) => r.lng && r.lat);
       return {
-        脚本版本: '2.10.0',
+        脚本版本: '2.11.0',
         找到地图: !!mapInstance,
         BMap可用: !!NS,
         BMap有Label: !!(NS && NS.Label),
